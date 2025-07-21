@@ -8,8 +8,12 @@ import logging
 from aiohttp import web
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
-from simplipy.system.v3 import SystemV3
 from simplipy.device.camera import Camera
+from simplipy.system.v3 import SystemV3
+from simplipy.websocket import (
+    EVENT_CAMERA_MOTION_DETECTED,
+    WebsocketEvent,
+)
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.camera import (
@@ -82,7 +86,10 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
         device: Camera,
     ) -> None:
         """Initialize the SimpliSafe camera."""
-        super().__init__(simplisafe, system, device=device)
+        super().__init__(
+            simplisafe, system, device=device,
+            additional_websocket_events=(EVENT_CAMERA_MOTION_DETECTED,)
+        )
         self.entity_description = CameraEntityDescription(
             key="live_view",
         )
@@ -177,3 +184,9 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
         path = f'cameras/{self._device.serial}/{self._system.system_id}/live-view'
         resp = await self._simplisafe._api.async_request('get', path, url_base=WEBRTC_URL_BASE)
         return TypeAdapter(LiveViewResponse).validate_python(resp)
+
+    @callback
+    def async_update_from_websocket_event(self, event: WebsocketEvent) -> None:
+        """Update the entity when new data comes from the websocket."""
+
+        _LOGGER.debug('Event recievied: %s', event)
