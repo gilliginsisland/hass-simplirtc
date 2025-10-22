@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, Callable
+from typing import Any
 import asyncio
 import json
 import base64
@@ -16,6 +16,13 @@ from aiohttp import (
 )
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
+
+from homeassistant.components.camera import (
+    WebRTCAnswer,
+    WebRTCCandidate,
+    WebRTCSendMessage,
+    RTCIceCandidateInit,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,17 +61,17 @@ class KinesisSession:
         session_id: str,
         channel_endpoint: str,
         client_id: str,
-        message_handler: Callable[[KinesisResponse], None],
+        send_message: WebRTCSendMessage,
     ) -> None:
         self._session_id = session_id
         self._channel_endpoint = channel_endpoint
         self._client_id = client_id
-        self._message_handler = message_handler
+        self._send_message = send_message
         self._session: ClientSession | None = None
         self._ws: ClientWebSocketResponse | None = None
         self._ready_event = asyncio.Event()
         self._reader_task: asyncio.Task | None = None
-        self._logger = _LOGGER.getChild(f"kinesis.{session_id}")
+        self._logger = _LOGGER.getChild(f"session.{session_id}")
         self._message_count = 0
 
     def _next_correlation_id(self) -> int:
@@ -105,15 +112,23 @@ class KinesisSession:
                     self._logger.exception("failed to parse message")
                     continue
 
-                self._message_handler(parsed)
+                payload = parsed.payload
+                match parsed.messageType:
+                    case "SDP_ANSWER":
+                        self._send_message(WebRTCAnswer(payload["sdp"]))
+                    case "ICE_CANDIDATE":
+                        candidate = RTCIceCandidateInit(
+                            candidate=payload.get("candidate"),
+                            sdp_mid=payload.get("sdpMid"),
+                            sdp_m_line_index=payload.get("sdpMLineIndex"),
+                        )
+                        self._send_message(WebRTCCandidate(candidate))
 
         finally:
             self._reader_task = None
             await self.close()
 
-    async def send_candidate(
-        self, candidate: str, *, sdp_mid: str | None, sdp_m_line_index: int | None
-    ) -> None:
+    async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
         await self._ready_event.wait()
 
         assert self._ws, "WebSocket not available"
@@ -123,9 +138,9 @@ class KinesisSession:
             recipientClientId=self._client_id,
             correlationId=f'{self._session_id}.{self._next_correlation_id()}',
         )).payload={
-            "candidate": candidate,
-            "sdpMid": sdp_mid,
-            "sdpMLineIndex": sdp_m_line_index,
+            "candidate": candidate.candidate,
+            "sdpMid": candidate.sdp_mid,
+            "sdpMLineIndex": candidate.sdp_m_line_index,
             "usernameFragment": None,
         }
 

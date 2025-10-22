@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable
+from typing import Any, Awaitable, Protocol
 import logging
 
 from aiohttp import web
@@ -34,10 +34,8 @@ from .const import (
     ATTR_CONFIG_ENTRY_ID,
     ENTRY_KEY,
 )
-from .kinesis import (
-    KinesisSession,
-    KinesisResponse,
-)
+from .kinesis import KinesisSession
+from .livekit import LiveKitSession
 
 _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE="https://app-hub.prd.aser.simplisafe.com/v2"
@@ -69,11 +67,31 @@ async def async_setup_entry(
     async_add_entities(cameras)
 
 
+class Session(Protocol):
+    async def stream(self, offer_sdp: str) -> None: ...
+    async def send_candidate(self, candidate: RTCIceCandidateInit) -> None: ...
+    async def close(self) -> None: ...
+
+
 @dataclass(kw_only=True, slots=True)
-class LiveViewResponse:
+class KenisisResponse:
     signedChannelEndpoint: str
     clientId: str
     iceServers: list[Any]
+
+
+@dataclass(kw_only=True, slots=True)
+class LiveKitResponse:
+    liveKitDetails: LiveKitDetails
+
+
+@dataclass(kw_only=True, slots=True)
+class LiveKitDetails:
+    liveKitURL: str
+    userToken: str
+
+
+LiveViewResponse = LiveKitResponse | KenisisResponse
 
 
 class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
@@ -120,31 +138,23 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
         """Handle a WebRTC offer."""
 
         self._sessions[session_id] = future = self.hass.loop.create_future()
-
-        def on_message(response: KinesisResponse) -> None:
-            payload = response.payload
-
-            if response.messageType == "SDP_ANSWER":
-                send_message(WebRTCAnswer(payload["sdp"]))
-
-            elif response.messageType == "ICE_CANDIDATE":
-                candidate = RTCIceCandidateInit(
-                    candidate=payload.get("candidate"),
-                    sdp_mid=payload.get("sdpMid"),
-                    sdp_m_line_index=payload.get("sdpMLineIndex"),
-                )
-                send_message(WebRTCCandidate(candidate))
-
         try:
             live_view = await self._create_stream()
-
-            session = KinesisSession(
-                session_id= session_id,
-                channel_endpoint=live_view.signedChannelEndpoint,
-                client_id=live_view.clientId,
-                message_handler=on_message,
-            )
-
+            match live_view:
+                case KenisisResponse():
+                    session = KinesisSession(
+                        session_id=session_id,
+                        channel_endpoint=live_view.signedChannelEndpoint,
+                        client_id=live_view.clientId,
+                        send_message=send_message,
+                    )
+                case LiveKitResponse():
+                    session = LiveKitSession(
+                        session_id=session_id,
+                        send_message=send_message,
+                        livekit_url=live_view.liveKitDetails.liveKitURL,
+                        user_token=live_view.liveKitDetails.userToken,
+                    )
             await session.stream(offer_sdp)
         except Exception as e:
             self._sessions.pop(session_id)
@@ -159,11 +169,7 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
         """Handle a WebRTC candidate."""
 
         session = await self._sessions[session_id]
-        await session.send_candidate(
-            candidate.candidate,
-            sdp_mid=candidate.sdp_mid,
-            sdp_m_line_index=candidate.sdp_m_line_index,
-        )
+        await session.send_candidate(candidate)
 
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
