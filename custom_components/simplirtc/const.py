@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from homeassistant.components.simplisafe import (
 	DOMAIN as SIMPLISAFE_DOMAIN,
 	SimpliSafe,
