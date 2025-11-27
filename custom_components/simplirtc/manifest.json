@@ -2,6 +2,7 @@
   "domain": "simplirtc",
   "name": "Simplisafe WebRTC Cameras",
   "dependencies": [
+    "go2rtc",
     "simplisafe"
   ],
   "codeowners": [

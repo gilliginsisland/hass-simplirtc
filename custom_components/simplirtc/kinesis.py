@@ -58,6 +58,7 @@ class KinesisResponse(KinesisMessage):
 class KinesisSession:
 	def __init__(
 		self,
+		*,
 		session_id: str,
 		channel_endpoint: str,
 		client_id: str,
