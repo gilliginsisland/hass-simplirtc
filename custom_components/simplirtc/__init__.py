@@ -4,21 +4,48 @@ from __future__ import annotations
 
 import asyncio
 
-from homeassistant.const import Platform
+import voluptuous as vol
+
+from homeassistant.const import (
+	Platform,
+	EVENT_HOMEASSISTANT_STOP,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import (
-	SOURCE_SYSTEM,
 	ConfigEntry,
 	ConfigEntryState,
 	ConfigEntryChange,
+	SOURCE_SYSTEM,
 	SIGNAL_CONFIG_ENTRY_CHANGED,
 )
 from homeassistant.helpers import discovery_flow
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.typing import ConfigType
 
-from .const import ATTR_CONFIG_ENTRY_ID, DOMAIN, SIMPLISAFE_DOMAIN
+from .const import (
+	DOMAIN,
+	SIMPLISAFE_DOMAIN,
+	ATTR_CONFIG_ENTRY_ID,
+	CONF_LIVEKIT_RTSP_PROXY,
+)
+from .utils import (
+	validate_rtsp_base_url,
+	ensure_binary,
+	Server,
+	DEFAULT_URL,
+)
 from .web import SimpliRTCStreamInfoView
+
+CONFIG_SCHEMA = vol.Schema(
+	{
+		DOMAIN: vol.Schema(
+			{
+				vol.Optional(CONF_LIVEKIT_RTSP_PROXY, default=None): vol.Any(None, validate_rtsp_base_url),
+			}
+		)
+	},
+	extra=vol.ALLOW_EXTRA,
+)
 
 PLATFORMS = [
 	Platform.CAMERA,
@@ -26,7 +53,16 @@ PLATFORMS = [
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-	"""Your controller/hub specific code."""
+	"""Set up the Simplirtc component."""
+	if (rtsp_url := config.get(DOMAIN, {}).get(CONF_LIVEKIT_RTSP_PROXY)) is not None:
+		hass.data[DOMAIN] = rtsp_url
+	else:
+		binary = await hass.async_add_executor_job(ensure_binary, hass)
+		if binary:
+			hass.data[DOMAIN] = DEFAULT_URL
+			server = Server(binary)
+			server.start()
+			hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, server.stop)
 
 	# Register API endpoint for stream info
 	hass.http.register_view(SimpliRTCStreamInfoView(hass))
@@ -45,7 +81,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 			case ConfigEntryChange.REMOVED:
 				# If the entry is removed, we need to unload the platforms
 				hass.async_create_task(_async_remove_config_entries(hass, entry.entry_id))
-
 
 	async_dispatcher_connect(
 		hass,

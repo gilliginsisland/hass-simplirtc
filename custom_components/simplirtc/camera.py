@@ -20,22 +20,23 @@ from homeassistant.components.camera import (
 	Camera as CameraEntity,
 	CameraEntityFeature,
 	CameraEntityDescription,
-	WebRTCAnswer,
-	WebRTCCandidate,
 	WebRTCSendMessage,
 	RTCIceCandidateInit,
 )
+from homeassistant.components.camera.webrtc import async_get_supported_provider
 from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+	DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
 	ENTRY_KEY,
 )
 from .kinesis import KinesisSession
-from .livekit import LiveKitSession
+from .go2rtc import Go2RTCSession
 
 _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE="https://app-hub.prd.aser.simplisafe.com/v2"
@@ -149,11 +150,26 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 						send_message=send_message,
 					)
 				case LiveKitResponse():
-					session = LiveKitSession(
+					# session = LiveKitSession(
+					# 	session_id=session_id,
+					# 	send_message=send_message,
+					# 	livekit_url=live_view.liveKitDetails.liveKitURL,
+					# 	user_token=live_view.liveKitDetails.userToken,
+					# )
+					if not (proxy := self.hass.data[DOMAIN]):
+						raise HomeAssistantError("Camera requires livekit and no proxy addon is configured")
+
+					url = live_view.liveKitDetails.liveKitURL
+					token = live_view.liveKitDetails.userToken
+					self._video_url = f"{proxy}/?url={url}&token={token}"
+					if not (provider := await async_get_supported_provider(self.hass, self)):
+						raise HomeAssistantError("Camera does not support WebRTC")
+
+					session = Go2RTCSession(
 						session_id=session_id,
 						send_message=send_message,
-						livekit_url=live_view.liveKitDetails.liveKitURL,
-						user_token=live_view.liveKitDetails.userToken,
+						camera=self,
+						provider=provider,
 					)
 			await session.stream(offer_sdp)
 		except Exception as e:
@@ -185,6 +201,7 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 
 	async def stream_source(self) -> str | None:
 		"""Return the source of the stream."""
+		return self._video_url
 
 	async def _create_stream(self) -> LiveViewResponse:
 		path = f'cameras/{self._device.serial}/{self._system.system_id}/live-view'

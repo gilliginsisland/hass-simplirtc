@@ -24,6 +24,7 @@ from .protobufs.livekit_rtc_pb2 import (
 	SessionDescription,
 	SignalRequest,
 	SignalResponse,
+	SignalTarget,
 	TrickleRequest,
 )
 
@@ -33,6 +34,7 @@ _LOGGER = logging.getLogger(__name__)
 class LiveKitSession:
 	def __init__(
 		self,
+		*,
 		session_id: str,
 		send_message: WebRTCSendMessage,
 		livekit_url: str,
@@ -74,7 +76,7 @@ class LiveKitSession:
 				self._logger.debug("<- Received SignalResponse: %s", response)
 				if response.HasField("offer"):
 					asyncio.create_task(self.on_offer(response.offer))
-				elif response.HasField("trickle"):
+				elif response.HasField("trickle") and response.trickle.target == SignalTarget.SUBSCRIBER:
 					asyncio.create_task(self.on_trickle(response.trickle))
 		except Exception as e:
 			self._logger.error("Error in WebSocket read loop: %s", e)
