@@ -46,6 +46,7 @@ class LiveKitSession:
 		self._ws: ClientWebSocketResponse | None = None
 		self._local_sdp: str | None = None
 		self._ready_event = asyncio.Event()
+		self._reader_task: asyncio.Task[None] | None = None
 		self._logger = _LOGGER.getChild(f"session.{session_id}")
 		self._ws_endpoint = f'{livekit_url}/rtc?access_token={user_token}&protocol=16'
 

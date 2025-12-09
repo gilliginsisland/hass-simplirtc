@@ -9,6 +9,7 @@ import subprocess
 import asyncio
 import time
 from threading import Thread
+from typing import Any
 from urllib.parse import urlparse
 
 import requests
@@ -21,6 +22,7 @@ _LOGGER = logging.getLogger(__name__)
 
 BINARY_VERSION = "0.4.3"
 
+REPO = "gilliginsisland/livekit-ffmpeg"
 ASSETS = {
     "Darwin": {
         "arm64": "livekit-rtsp-darwin-arm64",
@@ -43,7 +45,7 @@ def ensure_binary(hass: HomeAssistant) -> str | None:
     filename = hass.config.path(f"livekit-rtsp-{BINARY_VERSION}")
     try:
         if os.path.isfile(filename) and subprocess.run(
-            [filename, "-h"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True
+            [filename, "-h"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
         ):
             return filename
     except:
@@ -60,7 +62,7 @@ def ensure_binary(hass: HomeAssistant) -> str | None:
         return None
 
     # download new binary
-    url = f"https://github.com/gilliginsisland/livekit-ffmpeg/releases/download/v{BINARY_VERSION}/{asset}"
+    url = f"https://github.com/{REPO}/releases/download/v{BINARY_VERSION}/{asset}"
     _LOGGER.debug(f"Download new binary: {url}")
     r = requests.get(url)
     if not r.ok:
@@ -147,13 +149,15 @@ class Server(Thread):
 
             # check alive
             while self.process.poll() is None:
-                line = self.process.stdout.readline()
+                assert (stdout := self.process.stdout) is not None
+                line = stdout.readline()
                 if line == b"":
                     break
                 _LOGGER.debug(line[:-1].decode())
 
             time.sleep(2)
 
-    def stop(self, *args):
+    def stop(self, *_: Any):
         self.args = None
-        self.process.terminate()
+        if self.process is not None:
+            self.process.terminate()

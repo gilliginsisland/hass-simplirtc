@@ -5,7 +5,6 @@ from homeassistant.components.simplisafe import (
 	SimpliSafe,
 )
 from homeassistant.util.hass_dict import (
-	HassKey,
 	HassEntryKey,
 )
 

@@ -16,7 +16,10 @@ from homeassistant.config_entries import (
 	SOURCE_SYSTEM,
 	SIGNAL_CONFIG_ENTRY_CHANGED,
 )
-from homeassistant.helpers import discovery_flow
+from homeassistant.helpers import (
+	discovery_flow,
+	config_validation as cv,
+)
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.typing import ConfigType
 
@@ -24,7 +27,6 @@ from .const import (
 	DOMAIN,
 	SIMPLISAFE_DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
-	CONF_LIVEKIT_RTSP_PROXY,
 )
 from .utils import (
 	ensure_binary,
@@ -37,9 +39,14 @@ PLATFORMS = [
 	Platform.CAMERA,
 ]
 
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
+
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 	"""Set up the Simplirtc component."""
+	if DOMAIN not in config:
+		return True
+
 	binary = await hass.async_add_executor_job(ensure_binary, hass)
 	if binary:
 		hass.data[DOMAIN] = DEFAULT_URL

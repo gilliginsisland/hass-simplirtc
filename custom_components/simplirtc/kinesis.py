@@ -71,7 +71,7 @@ class KinesisSession:
 		self._session: ClientSession | None = None
 		self._ws: ClientWebSocketResponse | None = None
 		self._ready_event = asyncio.Event()
-		self._reader_task: asyncio.Task | None = None
+		self._reader_task: asyncio.Task[None] | None = None
 		self._logger = _LOGGER.getChild(f"session.{session_id}")
 		self._message_count = 0
 
@@ -124,6 +124,8 @@ class KinesisSession:
 							sdp_m_line_index=payload.get("sdpMLineIndex"),
 						)
 						self._send_message(WebRTCCandidate(candidate))
+					case _:
+						continue
 
 		finally:
 			self._reader_task = None

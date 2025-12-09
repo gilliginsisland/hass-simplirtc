@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Awaitable, Protocol
+from typing import Any, Protocol
+from collections.abc import Awaitable, Mapping
 import asyncio
 import logging
 
@@ -22,8 +23,8 @@ from homeassistant.components.camera import (
 	Camera as CameraEntity,
 	CameraEntityFeature,
 	CameraEntityDescription,
-	WebRTCSendMessage,
-	RTCIceCandidateInit,
+	WebRTCSendMessage,  # pyright: ignore[reportPrivateImportUsage]
+	RTCIceCandidateInit,  # pyright: ignore[reportPrivateImportUsage]
 )
 from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
@@ -48,7 +49,7 @@ async def async_setup_entry(
 ) -> None:
 	"""Set up a SimpliSafe Camera."""
 
-	entry_id = entry.data[ATTR_CONFIG_ENTRY_ID]
+	entry_id: str = entry.data[ATTR_CONFIG_ENTRY_ID]
 
 	_LOGGER.info("Setting up SimpliSafe Camera for entry: %s", entry_id)
 
@@ -62,7 +63,11 @@ async def async_setup_entry(
 			continue
 
 		for camera in system.cameras.values():
-			match (provider := camera.camera_settings.get('admin', {}).get('webRTCProvider', None)):
+			if not isinstance(settings := camera.camera_settings.get('admin'), Mapping):
+				_LOGGER.warning(f"Skipping camera '{camera.name}'. Unexpected settings schema.")
+				continue
+
+			match settings.get('webRTCProvider', None):
 				case 'mist':
 					cls = SimpliSafeLiveKitCamera
 					if not hass.data[DOMAIN]:
@@ -70,7 +75,7 @@ async def async_setup_entry(
 						continue
 				case 'kvs':
 					cls = SimpliSafeKenisisCamera
-				case _:
+				case _ as provider:
 					_LOGGER.warning(f"Camera '{camera.name}' has unknown webrtc provider '{provider}'")
 					continue
 
@@ -128,7 +133,7 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 
 	async def _create_stream(self) -> dict[str, Any]:
 		path = f'cameras/{self._device.serial}/{self._system.system_id}/live-view'
-		return await self._simplisafe._api.async_request('get', path, url_base=WEBRTC_URL_BASE)
+		return await self._simplisafe._api.async_request('get', path, url_base=WEBRTC_URL_BASE)  # pyright: ignore[reportPrivateUsage]
 
 
 class SimpliSafeLiveKitCamera(SimpliSafeCamera):
@@ -165,7 +170,7 @@ class SimpliSafeLiveKitCamera(SimpliSafeCamera):
 			self._livekit_url = live_view.liveKitDetails.liveKitURL
 			self._livekit_token = live_view.liveKitDetails.userToken
 			try:
-				decoded_token = jwt.decode(token, options={"verify_signature": False})
+				decoded_token = jwt.decode(self._livekit_token, options={"verify_signature": False})
 				self._cache_expiration = decoded_token['exp']
 			except Exception as e:
 				_LOGGER.warning(f"Failed to decode JWT token for caching: {e}")
