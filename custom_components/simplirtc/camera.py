@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Awaitable, Protocol
+import asyncio
 import logging
 
-from aiohttp import web
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
+from propcache import cached_property
 from simplipy.device.camera import Camera
 from simplipy.system.v3 import SystemV3
 from simplipy.websocket import (
 	EVENT_CAMERA_MOTION_DETECTED,
-	WebsocketEvent,
 )
+import jwt
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.camera import (
@@ -23,11 +25,9 @@ from homeassistant.components.camera import (
 	WebRTCSendMessage,
 	RTCIceCandidateInit,
 )
-from homeassistant.components.camera.webrtc import async_get_supported_provider
 from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -36,7 +36,6 @@ from .const import (
 	ENTRY_KEY,
 )
 from .kinesis import KinesisSession
-from .go2rtc import Go2RTCSession
 
 _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE="https://app-hub.prd.aser.simplisafe.com/v2"
@@ -63,7 +62,19 @@ async def async_setup_entry(
 			continue
 
 		for camera in system.cameras.values():
-			cameras.append(SimpliSafeCamera(simplisafe, system, camera))
+			match (provider := camera.camera_settings.get('admin', {}).get('webRTCProvider', None)):
+				case 'mist':
+					cls = SimpliSafeLiveKitCamera
+					if not hass.data[DOMAIN]:
+						_LOGGER.warning(f"Camera '{camera.name}' requires livekit and no proxy addon is configured")
+						continue
+				case 'kvs':
+					cls = SimpliSafeKenisisCamera
+				case _:
+					_LOGGER.warning(f"Camera '{camera.name}' has unknown webrtc provider '{provider}'")
+					continue
+
+			cameras.append(cls(simplisafe, system, camera))
 
 	async_add_entities(cameras)
 
@@ -92,9 +103,6 @@ class LiveKitDetails:
 	userToken: str
 
 
-LiveViewResponse = LiveKitResponse | KenisisResponse
-
-
 class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 	"""An implementation of a Simplisafe camera."""
 
@@ -114,24 +122,70 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 		)
 		CameraEntity.__init__(self)
 
-		self._video_url: str | None = None
 		self._attr_unique_id = f"{super().unique_id}-camera"
 		self._attr_supported_features |= CameraEntityFeature.STREAM
 		self._device: Camera
 
+	async def _create_stream(self) -> dict[str, Any]:
+		path = f'cameras/{self._device.serial}/{self._system.system_id}/live-view'
+		return await self._simplisafe._api.async_request('get', path, url_base=WEBRTC_URL_BASE)
+
+
+class SimpliSafeLiveKitCamera(SimpliSafeCamera):
+	"""An implementation of a Simplisafe camera."""
+
+	def __init__(self, simplisafe: SimpliSafe, system: SystemV3, device: Camera) -> None:
+		super().__init__(simplisafe, system, device)
+		self._livekit_url: str = ""
+		self._livekit_token: str = ""
+		self._cache_expiration: float = 0
+		self._lock = asyncio.Lock()
+
+	@cached_property
+	def use_stream_for_stills(self) -> bool:
+		"""Whether or not to use stream to generate stills."""
+		return True
+
+	async def stream_source(self) -> str | None:
+		"""Return the source of the stream."""
+
+		url, token = await self._live_view()
+		return f"rtsp://{self.hass.data[DOMAIN]}/{self._device.serial}?url={url}&token={token}"
+
+	async def _live_view(self) -> tuple[str, str]:
+		if time.time() < self._cache_expiration:
+			return self._livekit_url, self._livekit_token
+
+		async with self._lock:
+			if time.time() < self._cache_expiration:
+				return self._livekit_url, self._livekit_token
+
+			resp = await self._create_stream()
+			live_view = TypeAdapter(LiveKitResponse).validate_python(resp)
+			self._livekit_url = live_view.liveKitDetails.liveKitURL
+			self._livekit_token = live_view.liveKitDetails.userToken
+			try:
+				decoded_token = jwt.decode(token, options={"verify_signature": False})
+				self._cache_expiration = decoded_token['exp']
+			except Exception as e:
+				_LOGGER.warning(f"Failed to decode JWT token for caching: {e}")
+				self._cache_expiration = 0
+
+		return self._livekit_url, self._livekit_token
+
+
+class SimpliSafeKenisisCamera(SimpliSafeCamera):
+	"""An implementation of a Simplisafe camera."""
+
+	def __init__(
+		self,
+		simplisafe: SimpliSafe,
+		system: SystemV3,
+		device: Camera,
+	) -> None:
+		"""Initialize the SimpliSafe camera."""
+		super().__init__(simplisafe, system, device)
 		self._sessions: dict[str, Awaitable[KinesisSession]] = {}
-
-	async def async_camera_image(
-		self, width: int | None = None, height: int | None = None
-	) -> bytes | None:
-		"""Return bytes of camera image."""
-		return None
-
-	async def handle_async_mjpeg_stream(
-		self, request: web.Request
-	) -> web.StreamResponse | None:
-		"""Generate an HTTP MJPEG stream from the camera."""
-		return None
 
 	async def async_handle_async_webrtc_offer(
 		self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
@@ -140,37 +194,13 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 
 		self._sessions[session_id] = future = self.hass.loop.create_future()
 		try:
-			live_view = await self._create_stream()
-			match live_view:
-				case KenisisResponse():
-					session = KinesisSession(
-						session_id=session_id,
-						channel_endpoint=live_view.signedChannelEndpoint,
-						client_id=live_view.clientId,
-						send_message=send_message,
-					)
-				case LiveKitResponse():
-					# session = LiveKitSession(
-					# 	session_id=session_id,
-					# 	send_message=send_message,
-					# 	livekit_url=live_view.liveKitDetails.liveKitURL,
-					# 	user_token=live_view.liveKitDetails.userToken,
-					# )
-					if not (proxy := self.hass.data[DOMAIN]):
-						raise HomeAssistantError("Camera requires livekit and no proxy addon is configured")
-
-					url = live_view.liveKitDetails.liveKitURL
-					token = live_view.liveKitDetails.userToken
-					self._video_url = f"{proxy}/?url={url}&token={token}"
-					if not (provider := await async_get_supported_provider(self.hass, self)):
-						raise HomeAssistantError("Camera does not support WebRTC")
-
-					session = Go2RTCSession(
-						session_id=session_id,
-						send_message=send_message,
-						camera=self,
-						provider=provider,
-					)
+			live_view = TypeAdapter(KenisisResponse).validate_python(await self._create_stream())
+			session = KinesisSession(
+				session_id=session_id,
+				channel_endpoint=live_view.signedChannelEndpoint,
+				client_id=live_view.clientId,
+				send_message=send_message,
+			)
 			await session.stream(offer_sdp)
 		except Exception as e:
 			self._sessions.pop(session_id)
@@ -198,18 +228,3 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 			await (await session).close()
 
 		self.hass.async_create_task(close_session())
-
-	async def stream_source(self) -> str | None:
-		"""Return the source of the stream."""
-		return self._video_url
-
-	async def _create_stream(self) -> LiveViewResponse:
-		path = f'cameras/{self._device.serial}/{self._system.system_id}/live-view'
-		resp = await self._simplisafe._api.async_request('get', path, url_base=WEBRTC_URL_BASE)
-		return TypeAdapter(LiveViewResponse).validate_python(resp)
-
-	@callback
-	def async_update_from_websocket_event(self, event: WebsocketEvent) -> None:
-		"""Update the entity when new data comes from the websocket."""
-
-		_LOGGER.debug('Event recievied: %s', event)

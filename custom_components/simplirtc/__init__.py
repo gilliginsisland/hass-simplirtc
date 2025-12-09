@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import voluptuous as vol
-
 from homeassistant.const import (
 	Platform,
 	EVENT_HOMEASSISTANT_STOP,
@@ -29,23 +27,11 @@ from .const import (
 	CONF_LIVEKIT_RTSP_PROXY,
 )
 from .utils import (
-	validate_rtsp_base_url,
 	ensure_binary,
 	Server,
 	DEFAULT_URL,
 )
 from .web import SimpliRTCStreamInfoView
-
-CONFIG_SCHEMA = vol.Schema(
-	{
-		DOMAIN: vol.Schema(
-			{
-				vol.Optional(CONF_LIVEKIT_RTSP_PROXY, default=None): vol.Any(None, validate_rtsp_base_url),
-			}
-		)
-	},
-	extra=vol.ALLOW_EXTRA,
-)
 
 PLATFORMS = [
 	Platform.CAMERA,
@@ -54,15 +40,12 @@ PLATFORMS = [
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 	"""Set up the Simplirtc component."""
-	if (rtsp_url := config.get(DOMAIN, {}).get(CONF_LIVEKIT_RTSP_PROXY)) is not None:
-		hass.data[DOMAIN] = rtsp_url
-	else:
-		binary = await hass.async_add_executor_job(ensure_binary, hass)
-		if binary:
-			hass.data[DOMAIN] = DEFAULT_URL
-			server = Server(binary)
-			server.start()
-			hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, server.stop)
+	binary = await hass.async_add_executor_job(ensure_binary, hass)
+	if binary:
+		hass.data[DOMAIN] = DEFAULT_URL
+		server = Server(binary, f'--listen={DEFAULT_URL}')
+		server.start()
+		hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, server.stop)
 
 	# Register API endpoint for stream info
 	hass.http.register_view(SimpliRTCStreamInfoView(hass))

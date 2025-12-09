@@ -7,11 +7,12 @@ import re
 import stat
 import subprocess
 import asyncio
+import time
 from threading import Thread
 from urllib.parse import urlparse
 
 import requests
-import voluptuous as vol
+
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
@@ -31,7 +32,7 @@ ASSETS = {
     },
 }
 
-DEFAULT_URL = "rtsp://127.0.0.1:8854"
+DEFAULT_URL = "127.0.0.1:8854"
 
 BINARY_NAME = re.compile(
     r"^(livekit-rtsp-\d\.\d\.\d+)(\.exe)?$"
@@ -41,7 +42,9 @@ BINARY_NAME = re.compile(
 def ensure_binary(hass: HomeAssistant) -> str | None:
     filename = hass.config.path(f"livekit-rtsp-{BINARY_VERSION}")
     try:
-        if os.path.isfile(filename) and subprocess.run([filename, "-h"], check=True):
+        if os.path.isfile(filename) and subprocess.run(
+            [filename, "-h"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True
+        ):
             return filename
     except:
         pass
@@ -126,28 +129,10 @@ async def check_rtsp_server(rtsp_url: str, timeout: int = 2) -> bool:
     return "RTSP/1.0 200 OK" == response_line.decode('utf-8').strip()
 
 
-def validate_rtsp_base_url(value):
-    """
-    Validates that a URL is an RTSP URL with no path, query, or fragment.
-    """
-    parsed_url = urlparse(str(value))
-    if parsed_url.scheme != 'rtsp':
-        raise vol.Invalid("URL must use 'rtsp://' scheme.")
-    if not parsed_url.netloc:
-        raise vol.Invalid("URL must contain a network location (hostname or IP, and optional port).")
-    if parsed_url.path and parsed_url.path != '/': # Allow empty or root path
-        raise vol.Invalid("URL must not contain a path.")
-    if parsed_url.query:
-        raise vol.Invalid("URL must not contain query parameters.")
-    if parsed_url.fragment:
-        raise vol.Invalid("URL must not contain URL fragments.")
-    return str(value)
-
-
 class Server(Thread):
-    def __init__(self, binary: str):
+    def __init__(self, *args: str):
         super().__init__(name=DOMAIN, daemon=True)
-        self.binary = binary
+        self.args = args
         self.process = None
 
     @property
@@ -155,9 +140,9 @@ class Server(Thread):
         return self.process.poll() is None if self.process else False
 
     def run(self):
-        while self.binary:
+        while self.args:
             self.process = subprocess.Popen(
-                [self.binary], stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                self.args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
             )
 
             # check alive
@@ -167,6 +152,8 @@ class Server(Thread):
                     break
                 _LOGGER.debug(line[:-1].decode())
 
+            time.sleep(2)
+
     def stop(self, *args):
-        self.binary = None
+        self.args = None
         self.process.terminate()
