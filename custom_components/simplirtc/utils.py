@@ -20,7 +20,7 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-BINARY_VERSION = "0.4.3"
+BINARY_VERSION = "0.4.4"
 
 REPO = "gilliginsisland/livekit-ffmpeg"
 ASSETS = {
