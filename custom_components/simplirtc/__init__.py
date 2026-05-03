@@ -22,10 +22,12 @@ from homeassistant.helpers import (
 )
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.components.simplisafe import (
+	DOMAIN as SIMPLISAFE_DOMAIN,
+)
 
 from .const import (
 	DOMAIN,
-	SIMPLISAFE_DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
 )
 from .utils import (

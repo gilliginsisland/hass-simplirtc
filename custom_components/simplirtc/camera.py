@@ -34,7 +34,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
 	DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
-	ENTRY_KEY,
 )
 from .kinesis import KinesisSession
 
@@ -53,7 +52,11 @@ async def async_setup_entry(
 
 	_LOGGER.info("Setting up SimpliSafe Camera for entry: %s", entry_id)
 
-	simplisafe = hass.data[ENTRY_KEY][entry_id]
+	simplisafe_entry: ConfigEntry[SimpliSafe] | None
+	if not (simplisafe_entry := hass.config_entries.async_get_entry(entry_id)):
+		_LOGGER.warning("Missing SimpliSafe entry: %s", entry_id)
+		return
+	simplisafe = simplisafe_entry.runtime_data
 
 	cameras: list[SimpliSafeCamera] = []
 
