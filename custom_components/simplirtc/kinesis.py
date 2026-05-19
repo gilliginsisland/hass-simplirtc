@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any
+from typing import Any, override
 import asyncio
 import json
 import base64
@@ -14,6 +14,7 @@ from aiohttp import (
 	ClientSession,
 	ClientWebSocketResponse,
 )
+from webrtc_models import RTCIceCandidateInit
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
 
@@ -21,8 +22,9 @@ from homeassistant.components.camera import (
 	WebRTCAnswer,
 	WebRTCCandidate,
 	WebRTCSendMessage,
-	RTCIceCandidateInit,
 )
+
+from .session import Session
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,7 +57,7 @@ class KinesisResponse(KinesisMessage):
 	statusResponse: Any = None
 
 
-class KinesisSession:
+class KinesisSession(Session):
 	def __init__(
 		self,
 		*,
@@ -79,6 +81,7 @@ class KinesisSession:
 		self._message_count += 1
 		return self._message_count
 
+	@override
 	async def stream(self, offer_sdp: str) -> None:
 		(offer_msg := KinesisRequest(
 			action="SDP_OFFER",
@@ -116,14 +119,14 @@ class KinesisSession:
 				payload = parsed.payload
 				match parsed.messageType:
 					case "SDP_ANSWER":
-						self._send_message(WebRTCAnswer(payload["sdp"]))
+						self._send_message(WebRTCAnswer(answer=payload["sdp"]))
 					case "ICE_CANDIDATE":
 						candidate = RTCIceCandidateInit(
-							candidate=payload.get("candidate"),
+							candidate=payload.get("candidate", ""),
 							sdp_mid=payload.get("sdpMid"),
 							sdp_m_line_index=payload.get("sdpMLineIndex"),
 						)
-						self._send_message(WebRTCCandidate(candidate))
+						self._send_message(WebRTCCandidate(candidate=candidate))
 					case _:
 						continue
 
@@ -131,6 +134,7 @@ class KinesisSession:
 			self._reader_task = None
 			await self.close()
 
+	@override
 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
 		await self._ready_event.wait()
 
@@ -150,6 +154,7 @@ class KinesisSession:
 		self._logger.debug("-> %s", candidate_msg)
 		await self._ws.send_json(asdict(candidate_msg))
 
+	@override
 	async def close(self) -> None:
 		if self._reader_task:
 			self._reader_task.cancel()

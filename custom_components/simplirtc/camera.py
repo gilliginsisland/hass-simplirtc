@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Protocol
-from collections.abc import Awaitable, Mapping
+from typing import Any, override
+from collections.abc import Mapping
 import asyncio
 import logging
 
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
-from propcache import cached_property
 from simplipy.device.camera import Camera
 from simplipy.system.v3 import SystemV3
 from simplipy.websocket import (
@@ -23,22 +22,24 @@ from homeassistant.components.camera import (
 	Camera as CameraEntity,
 	CameraEntityFeature,
 	CameraEntityDescription,
-	WebRTCSendMessage,  # pyright: ignore[reportPrivateImportUsage]
-	RTCIceCandidateInit,  # pyright: ignore[reportPrivateImportUsage]
+	WebRTCAnswer,
+	WebRTCSendMessage,
 )
 from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from webrtc_models import RTCIceCandidateInit
 
 from .const import (
-	DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
 )
 from .kinesis import KinesisSession
+from .livekit import LiveKitSession
+from .session import Session
 
 _LOGGER = logging.getLogger(__name__)
-WEBRTC_URL_BASE="https://app-hub.prd.aser.simplisafe.com/v2"
+WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
 
 
 async def async_setup_entry(
@@ -73,9 +74,6 @@ async def async_setup_entry(
 			match settings.get('webRTCProvider', None):
 				case 'mist':
 					cls = SimpliSafeLiveKitCamera
-					if not hass.data[DOMAIN]:
-						_LOGGER.warning(f"Camera '{camera.name}' requires livekit and no proxy addon is configured")
-						continue
 				case 'kvs':
 					cls = SimpliSafeKenisisCamera
 				case _ as provider:
@@ -85,12 +83,6 @@ async def async_setup_entry(
 			cameras.append(cls(simplisafe, system, camera))
 
 	async_add_entities(cameras)
-
-
-class Session(Protocol):
-	async def stream(self, offer_sdp: str) -> None: ...
-	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None: ...
-	async def close(self) -> None: ...
 
 
 @dataclass(kw_only=True, slots=True)
@@ -133,10 +125,74 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 		self._attr_unique_id = f"{super().unique_id}-camera"
 		self._attr_supported_features |= CameraEntityFeature.STREAM
 		self._device: Camera
+		self._sessions: dict[str, asyncio.Task[Session]] = {}
 
 	async def _create_stream(self) -> dict[str, Any]:
 		path = f'cameras/{self._device.serial}/{self._system.system_id}/live-view'
 		return await self._simplisafe._api.async_request('get', path, url_base=WEBRTC_URL_BASE)  # pyright: ignore[reportPrivateUsage]
+
+	async def async_handle_async_webrtc_offer(
+		self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
+	) -> None:
+		"""Handle a WebRTC offer."""
+
+		self._sessions[session_id] = task = self.hass.async_create_task(
+			self._start_webrtc_session(offer_sdp, session_id, send_message)
+		)
+		try:
+			await task
+		except (asyncio.CancelledError, Exception):
+			self._sessions.pop(session_id, None)
+			if not task.done():
+				task.cancel()
+			raise
+
+	async def async_on_webrtc_candidate(
+		self, session_id: str, candidate: RTCIceCandidateInit
+	) -> None:
+		"""Handle a WebRTC candidate."""
+
+		if (task := self._sessions.get(session_id)) is None:
+			_LOGGER.debug("Ignoring WebRTC candidate for closed session %s", session_id)
+			return
+		try:
+			session = await task
+		except asyncio.CancelledError:
+			return
+		except Exception as err:
+			_LOGGER.debug("Ignoring WebRTC candidate for failed session %s: %s", session_id, err)
+			return
+		await session.send_candidate(candidate)
+
+	@callback
+	def close_webrtc_session(self, session_id: str) -> None:
+		"""Close a WebRTC session."""
+
+		if (task := self._sessions.pop(session_id, None)) is None:
+			return
+
+		async def close_session() -> None:
+			if not task.done():
+				task.cancel()
+			try:
+				session = await task
+			except asyncio.CancelledError:
+				return
+			except Exception as err:
+				_LOGGER.debug(
+					"WebRTC session %s ended before startup completed: %s",
+					session_id,
+					err,
+				)
+				return
+			await session.close()
+
+		self.hass.async_create_task(close_session())
+
+	async def _start_webrtc_session(
+		self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
+	) -> Session:
+		raise NotImplementedError
 
 
 class SimpliSafeLiveKitCamera(SimpliSafeCamera):
@@ -149,16 +205,18 @@ class SimpliSafeLiveKitCamera(SimpliSafeCamera):
 		self._cache_expiration: float = 0
 		self._lock = asyncio.Lock()
 
-	@cached_property
-	def use_stream_for_stills(self) -> bool:
-		"""Whether or not to use stream to generate stills."""
-		return True
-
-	async def stream_source(self) -> str | None:
-		"""Return the source of the stream."""
-
-		url, token = await self._live_view()
-		return f"rtsp://{self.hass.data[DOMAIN]}/{self._device.serial}?url={url}&token={token}"
+	@override
+	async def _start_webrtc_session(
+		self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
+	) -> LiveKitSession:
+		livekit_url, livekit_token = await self._live_view()
+		return await LiveKitSession.create(
+			session_id=session_id,
+			send_answer=lambda answer_sdp: send_message(WebRTCAnswer(answer=answer_sdp)),
+			livekit_url=livekit_url,
+			user_token=livekit_token,
+			offer_sdp=offer_sdp,
+		)
 
 	async def _live_view(self) -> tuple[str, str]:
 		if time.time() < self._cache_expiration:
@@ -193,46 +251,21 @@ class SimpliSafeKenisisCamera(SimpliSafeCamera):
 	) -> None:
 		"""Initialize the SimpliSafe camera."""
 		super().__init__(simplisafe, system, device)
-		self._sessions: dict[str, Awaitable[KinesisSession]] = {}
 
-	async def async_handle_async_webrtc_offer(
+	@override
+	async def _start_webrtc_session(
 		self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
-	) -> None:
-		"""Handle a WebRTC offer."""
-
-		self._sessions[session_id] = future = self.hass.loop.create_future()
+	) -> KinesisSession:
+		live_view = TypeAdapter(KenisisResponse).validate_python(await self._create_stream())
+		session = KinesisSession(
+			session_id=session_id,
+			channel_endpoint=live_view.signedChannelEndpoint,
+			client_id=live_view.clientId,
+			send_message=send_message,
+		)
 		try:
-			live_view = TypeAdapter(KenisisResponse).validate_python(await self._create_stream())
-			session = KinesisSession(
-				session_id=session_id,
-				channel_endpoint=live_view.signedChannelEndpoint,
-				client_id=live_view.clientId,
-				send_message=send_message,
-			)
 			await session.stream(offer_sdp)
-		except Exception as e:
-			self._sessions.pop(session_id)
-			future.set_exception(e)
+		except (asyncio.CancelledError, Exception):
+			await session.close()
 			raise
-		else:
-			future.set_result(session)
-
-	async def async_on_webrtc_candidate(
-		self, session_id: str, candidate: RTCIceCandidateInit
-	) -> None:
-		"""Handle a WebRTC candidate."""
-
-		session = await self._sessions[session_id]
-		await session.send_candidate(candidate)
-
-	@callback
-	def close_webrtc_session(self, session_id: str) -> None:
-		"""Close a WebRTC session."""
-
-		if (session := self._sessions.pop(session_id, None)) is None:
-			return
-
-		async def close_session() -> None:
-			await (await session).close()
-
-		self.hass.async_create_task(close_session())
+		return session

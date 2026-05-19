@@ -6,7 +6,6 @@ import asyncio
 
 from homeassistant.const import (
 	Platform,
-	EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import (
@@ -30,11 +29,6 @@ from .const import (
 	DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
 )
-from .utils import (
-	ensure_binary,
-	Server,
-	DEFAULT_URL,
-)
 from .web import SimpliRTCStreamInfoView
 
 PLATFORMS = [
@@ -49,14 +43,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 	if DOMAIN not in config:
 		return True
 
-	binary = await hass.async_add_executor_job(ensure_binary, hass)
-	if binary:
-		hass.data[DOMAIN] = DEFAULT_URL
-		server = Server(binary, f'--listen={DEFAULT_URL}')
-		server.start()
-		hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, server.stop)
-
-	# Register API endpoint for stream info
 	hass.http.register_view(SimpliRTCStreamInfoView(hass))
 
 	@callback
