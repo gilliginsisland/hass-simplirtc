@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="SimpliRTC">
+  <defs>
+    <filter id="shield-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#000000" flood-opacity="0.2"/>
+    </filter>
+  </defs>
+
+  <g id="webrtc-mark">
+    <circle cx="128" cy="66" r="52" fill="#bf0000"/>
+    <circle cx="64" cy="112" r="52" fill="#0089cc"/>
+    <circle cx="192" cy="112" r="52" fill="#ffcc00"/>
+    <circle cx="89" cy="192" r="52" fill="#ff6600"/>
+    <circle cx="169" cy="192" r="52" fill="#009939"/>
+  </g>
+
+  <g id="shield" filter="url(#shield-shadow)">
+    <path
+      d="M324.478,51.943L177.986,0.285c-1.076-0.38-2.25-0.38-3.326,0L28.166,51.943c-1.999,0.705-3.337,2.595-3.337,4.715c0,52.278,13.834,112.711,37.956,165.805c19.566,43.069,54.751,100.519,111.248,129.625c0.719,0.37,1.504,0.555,2.29,0.555s1.571-0.185,2.29-0.555c56.496-29.106,91.68-86.556,111.247-129.625c24.121-53.094,37.955-113.527,37.955-165.805C327.815,54.538,326.477,52.648,324.478,51.943z"
+      transform="translate(52 56) scale(0.43)"
+      fill="#ffffff"
+    />
+  </g>
+
+  <path
+    id="simplisafe-s"
+    d="M36.21,16.71a12.21,12.21,0,0,0-24.42,0v5H36.21v9.58a12.21,12.21,0,0,1-24.42,0V28.75"
+    transform="translate(78 83) scale(2.1)"
+    fill="none"
+    stroke="#222222"
+    stroke-width="3.4"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>
