@@ -23,6 +23,8 @@ from homeassistant.components.camera import (
 	CameraEntityFeature,
 	CameraEntityDescription,
 	WebRTCAnswer,
+	WebRTCCandidate,
+	WebRTCMessage,
 	WebRTCSendMessage,
 )
 from homeassistant.components.simplisafe import SimpliSafe
@@ -37,6 +39,7 @@ from .const import (
 from .kinesis import KinesisSession
 from .livekit import LiveKitSession
 from .session import Session
+from .snapshot import DEFAULT_SNAPSHOT_TIMEOUT, Snapshotter
 
 _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
@@ -188,6 +191,38 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 			await session.close()
 
 		self.hass.async_create_task(close_session())
+
+	@override
+	async def async_camera_image(
+		self,
+		width: int | None = None,
+		height: int | None = None,
+	) -> bytes | None:
+		"""Return a camera image from a temporary WebRTC session."""
+		_ = width, height
+		snapshotter = Snapshotter()
+		try:
+			offer_sdp = await snapshotter.make_offer()
+
+			def send_message(message: WebRTCMessage) -> None:
+				if isinstance(message, WebRTCAnswer):
+					snapshotter.send_answer(message.answer)
+				elif isinstance(message, WebRTCCandidate):
+					snapshotter.send_candidate(message.candidate)
+
+			async with asyncio.timeout(DEFAULT_SNAPSHOT_TIMEOUT):
+				await self.async_handle_async_webrtc_offer(
+					offer_sdp,
+					snapshotter.session_id,
+					send_message,
+				)
+				return await snapshotter.wait_for_image()
+		except TimeoutError:
+			_LOGGER.debug("Timed out waiting for WebRTC camera image")
+			return None
+		finally:
+			self.close_webrtc_session(snapshotter.session_id)
+			await snapshotter.close()
 
 	async def _start_webrtc_session(
 		self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
