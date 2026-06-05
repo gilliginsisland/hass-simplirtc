@@ -12,7 +12,7 @@ from aiortc import (
 	RTCPeerConnection,
 	RTCSessionDescription,
 )
-from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
+from aiortc.mediastreams import MediaStreamTrack
 from aiortc.sdp import candidate_from_sdp
 from av.video.frame import VideoFrame
 from PIL.Image import Image
@@ -58,9 +58,9 @@ class Snapshotter:
 		"""Create a video-only WebRTC offer for snapshot capture."""
 		self._pc.addTransceiver("video", direction="recvonly")
 		await self._pc.setLocalDescription()
-		if self._pc.localDescription is None:
+		if not (local_description := self._pc.localDescription):
 			raise RuntimeError("Snapshot peer connection did not create an SDP offer")
-		return self._pc.localDescription.sdp
+		return local_description.sdp
 
 	async def wait_for_image(self) -> bytes:
 		"""Wait for the first decoded video frame as JPEG bytes."""
@@ -74,9 +74,7 @@ class Snapshotter:
 	def _fail_frame_on_task_error(self, task: asyncio.Task[Any]) -> None:
 		if task.cancelled() or self._frame_future.done():
 			return
-		try:
-			task.result()
-		except Exception as err:
+		if err := task.exception():
 			self._frame_future.set_exception(err)
 
 	async def _add_remote_candidate(self, candidate: RTCIceCandidate | RTCIceCandidateInit) -> None:
@@ -110,18 +108,17 @@ class Snapshotter:
 		try:
 			while not self._frame_future.done():
 				frame = await track.recv()
-				if isinstance(frame, VideoFrame):
-					image = await asyncio.to_thread(_frame_to_jpeg, frame)
-					if not self._frame_future.done():
-						self._frame_future.set_result(image)
-					return
-		except MediaStreamError as err:
-			if not self._frame_future.done():
-				self._frame_future.set_exception(err)
+				if not isinstance(frame, VideoFrame):
+					continue
+				image = await asyncio.to_thread(_frame_to_jpeg, frame)
+				if not self._frame_future.done():
+					self._frame_future.set_result(image)
+				return
 		except Exception as err:
 			if not self._frame_future.done():
 				self._frame_future.set_exception(err)
 
 	def _on_track(self, track: MediaStreamTrack) -> None:
-		if track.kind == "video":
-			asyncio.create_task(self._read_video_frame(track))
+		if track.kind != "video":
+			return
+		asyncio.create_task(self._read_video_frame(track))

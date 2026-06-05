@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, override
 import asyncio
-import json
 import base64
-import logging
 from dataclasses import asdict
+import json
+import logging
+from typing import Any, override
 
 from aiohttp import (
 	ClientSession,
@@ -66,11 +66,12 @@ class KinesisSession(Session):
 		client_id: str,
 		send_message: WebRTCSendMessage,
 	) -> None:
+		super().__init__()
 		self._session_id = session_id
 		self._channel_endpoint = channel_endpoint
 		self._client_id = client_id
 		self._send_message = send_message
-		self._session: ClientSession | None = None
+		self._session = ClientSession()
 		self._ws: ClientWebSocketResponse | None = None
 		self._ready_event = asyncio.Event()
 		self._reader_task: asyncio.Task[None] | None = None
@@ -82,29 +83,24 @@ class KinesisSession(Session):
 		return self._message_count
 
 	@override
-	async def stream(self, offer_sdp: str) -> None:
-		(offer_msg := KinesisRequest(
+	async def _stream(self, offer_sdp: str) -> None:
+		offer_msg = KinesisRequest(
 			action="SDP_OFFER",
 			recipientClientId=self._client_id,
-			correlationId=f'{self._session_id}.{self._next_correlation_id()}',
-		)).payload={"type": "offer", "sdp": offer_sdp}
+			correlationId=f"{self._session_id}.{self._next_correlation_id()}",
+		)
+		offer_msg.payload = {"type": "offer", "sdp": offer_sdp}
 
-		try:
-			self._session = session = ClientSession()
-			self._ws = ws = await session.ws_connect(self._channel_endpoint)
-			self._logger.debug("-> %s", offer_msg)
+		self._ws = ws = await self._session.ws_connect(self._channel_endpoint)
+		self._logger.debug("-> %s", offer_msg)
 
-			await ws.send_json(asdict(offer_msg))
-			self._reader_task = asyncio.create_task(self._read())
-		except Exception:
-			await self.close()
-			raise
-		finally:
-			self._ready_event.set()
+		await ws.send_json(asdict(offer_msg))
+		self._reader_task = asyncio.create_task(self._read())
+		self._ready_event.set()
 
 	async def _read(self) -> None:
 		try:
-			assert self._ws is not None, "WebSocket connection not established"
+			assert self._ws, "WebSocket connection not established"
 			async for msg in self._ws:
 				self._logger.debug("<- %s", msg.data)
 
@@ -131,21 +127,26 @@ class KinesisSession(Session):
 					case _:
 						continue
 
+		except asyncio.CancelledError:
+			raise
+		except Exception as err:
+			self._logger.error("Error in Kinesis WebSocket read loop: %s", err)
 		finally:
 			self._reader_task = None
-			await self.close()
+			self.close()
 
 	@override
 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
-		await self._ready_event.wait()
+		await self._wait(self._ready_event)
 
 		assert self._ws, "WebSocket not available"
 
-		(candidate_msg := KinesisRequest(
+		candidate_msg = KinesisRequest(
 			action="ICE_CANDIDATE",
 			recipientClientId=self._client_id,
-			correlationId=f'{self._session_id}.{self._next_correlation_id()}',
-		)).payload={
+			correlationId=f"{self._session_id}.{self._next_correlation_id()}",
+		)
+		candidate_msg.payload = {
 			"candidate": candidate.candidate,
 			"sdpMid": candidate.sdp_mid,
 			"sdpMLineIndex": candidate.sdp_m_line_index,
@@ -156,16 +157,20 @@ class KinesisSession(Session):
 		await self._ws.send_json(asdict(candidate_msg))
 
 	@override
-	async def close(self) -> None:
+	async def _close(self) -> None:
 		if self._reader_task:
 			self._reader_task.cancel()
 			try:
 				await self._reader_task
 			except asyncio.CancelledError:
 				pass
-		if self._ws:
-			await self._ws.close()
-			self._ws = None
-		if self._session:
-			await self._session.close()
-			self._session = None
+		results = await asyncio.gather(*(
+			closer.close()
+			for closer in (self._ws, self._session)
+			if closer
+		), return_exceptions=True)
+		if errors := tuple(
+			result for result in results
+			if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+		):
+			raise BaseExceptionGroup("Error closing Kinesis session", errors)
