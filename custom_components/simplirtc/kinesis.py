@@ -5,28 +5,20 @@ from __future__ import annotations
 from abc import ABC
 import asyncio
 import base64
+from collections.abc import Callable
 from dataclasses import asdict
 import json
 import logging
-from typing import Any, override
+from typing import Any
 
-from aiohttp import (
-	ClientSession,
-	ClientWebSocketResponse,
-)
-from webrtc_models import RTCIceCandidateInit
+from aiohttp import ClientSession
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
 
-from homeassistant.components.camera import (
-	WebRTCAnswer,
-	WebRTCCandidate,
-	WebRTCSendMessage,
-)
-
-from .session import Session
-
 _LOGGER = logging.getLogger(__name__)
+
+SendAnswer = Callable[[str], None]
+SendCandidate = Callable[[str, str | None, int | None], None]
 
 
 @dataclass(kw_only=True, slots=True, config={"extra": "ignore"})
@@ -57,33 +49,68 @@ class KinesisResponse(KinesisMessage):
 	statusResponse: Any = None
 
 
-class KinesisSession(Session):
+class KinesisSession:
 	def __init__(
 		self,
 		*,
 		session_id: str,
 		channel_endpoint: str,
 		client_id: str,
-		send_message: WebRTCSendMessage,
+		send_answer: SendAnswer,
+		send_candidate: SendCandidate,
 	) -> None:
-		super().__init__()
 		self._session_id = session_id
 		self._channel_endpoint = channel_endpoint
 		self._client_id = client_id
-		self._send_message = send_message
-		self._session = ClientSession()
-		self._ws: ClientWebSocketResponse | None = None
-		self._ready_event = asyncio.Event()
+		self._send_answer = send_answer
+		self._send_candidate = send_candidate
+		self._candidate_queue: asyncio.Queue[KinesisRequest] = asyncio.Queue()
 		self._reader_task: asyncio.Task[None] | None = None
 		self._logger = _LOGGER.getChild(f"session.{session_id}")
 		self._message_count = 0
+
+	def start(self, offer_sdp: str) -> None:
+		"""Start streaming in the background."""
+		self._reader_task = task = asyncio.create_task(self._read(offer_sdp))
+		def log_task_error(task: asyncio.Task[None]) -> None:
+			if self._reader_task is task:
+				self._reader_task = None
+			if not task.cancelled():
+				try:
+					task.result()
+				except BaseException as err:
+					self._logger.error("Error in Kinesis session: %s", err)
+		task.add_done_callback(log_task_error)
+
+	async def send_candidate(
+		self,
+		candidate: str,
+		*,
+		sdp_mid: str | None = None,
+		sdp_m_line_index: int | None = None,
+	) -> None:
+		candidate_msg = KinesisRequest(
+			action="ICE_CANDIDATE",
+			recipientClientId=self._client_id,
+			correlationId=f"{self._session_id}.{self._next_correlation_id()}",
+		)
+		candidate_msg.payload = {
+			"candidate": candidate,
+			"sdpMid": sdp_mid,
+			"sdpMLineIndex": sdp_m_line_index,
+			"usernameFragment": None,
+		}
+		await self._candidate_queue.put(candidate_msg)
+
+	def close(self) -> None:
+		if self._reader_task:
+			self._reader_task.cancel()
 
 	def _next_correlation_id(self) -> int:
 		self._message_count += 1
 		return self._message_count
 
-	@override
-	async def _stream(self, offer_sdp: str) -> None:
+	async def _read(self, offer_sdp: str) -> None:
 		offer_msg = KinesisRequest(
 			action="SDP_OFFER",
 			recipientClientId=self._client_id,
@@ -91,86 +118,47 @@ class KinesisSession(Session):
 		)
 		offer_msg.payload = {"type": "offer", "sdp": offer_sdp}
 
-		self._ws = ws = await self._session.ws_connect(self._channel_endpoint)
-		self._logger.debug("-> %s", offer_msg)
+		async with (
+			ClientSession() as session,
+			session.ws_connect(self._channel_endpoint) as ws,
+		):
+			self._logger.debug("-> %s", offer_msg)
+			await ws.send_json(asdict(offer_msg))
 
-		await ws.send_json(asdict(offer_msg))
-		self._reader_task = asyncio.create_task(self._read())
-		self._ready_event.set()
+			async def send_kinesis_candidates() -> None:
+				while True:
+					candidate_msg = await self._candidate_queue.get()
+					self._logger.debug("-> %s", candidate_msg)
+					await ws.send_json(asdict(candidate_msg))
 
-	async def _read(self) -> None:
-		try:
-			assert self._ws, "WebSocket connection not established"
-			async for msg in self._ws:
-				self._logger.debug("<- %s", msg.data)
+			async def receive_kinesis_messages() -> None:
+				async for msg in ws:
+					self._logger.debug("<- %s", msg.data)
 
-				if msg.data == "":
-					continue  # Ignore empty messages
+					if msg.data == "":
+						continue  # Ignore empty messages
 
-				try:
-					parsed = TypeAdapter(KinesisResponse).validate_json(msg.data)
-				except Exception:
-					self._logger.exception("failed to parse message")
-					continue
-
-				payload = parsed.payload
-				match parsed.messageType:
-					case "SDP_ANSWER":
-						self._send_message(WebRTCAnswer(answer=payload["sdp"]))
-					case "ICE_CANDIDATE":
-						candidate = RTCIceCandidateInit(
-							candidate=payload.get("candidate", ""),
-							sdp_mid=payload.get("sdpMid"),
-							sdp_m_line_index=payload.get("sdpMLineIndex"),
-						)
-						self._send_message(WebRTCCandidate(candidate=candidate))
-					case _:
+					try:
+						parsed = TypeAdapter(KinesisResponse).validate_json(msg.data)
+					except Exception:
+						self._logger.exception("failed to parse message")
 						continue
 
-		except asyncio.CancelledError:
-			raise
-		except Exception as err:
-			self._logger.error("Error in Kinesis WebSocket read loop: %s", err)
-		finally:
-			self._reader_task = None
-			self.close()
+					payload = parsed.payload
+					match parsed.messageType:
+						case "SDP_ANSWER":
+							self._send_answer(payload["sdp"])
+						case "ICE_CANDIDATE":
+							self._send_candidate(
+								payload.get("candidate", ""),
+								payload.get("sdpMid"),
+								payload.get("sdpMLineIndex"),
+							)
+						case _:
+							continue
 
-	@override
-	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
-		await self._wait(self._ready_event)
+				self.close()
 
-		assert self._ws, "WebSocket not available"
-
-		candidate_msg = KinesisRequest(
-			action="ICE_CANDIDATE",
-			recipientClientId=self._client_id,
-			correlationId=f"{self._session_id}.{self._next_correlation_id()}",
-		)
-		candidate_msg.payload = {
-			"candidate": candidate.candidate,
-			"sdpMid": candidate.sdp_mid,
-			"sdpMLineIndex": candidate.sdp_m_line_index,
-			"usernameFragment": None,
-		}
-
-		self._logger.debug("-> %s", candidate_msg)
-		await self._ws.send_json(asdict(candidate_msg))
-
-	@override
-	async def _close(self) -> None:
-		if self._reader_task:
-			self._reader_task.cancel()
-			try:
-				await self._reader_task
-			except asyncio.CancelledError:
-				pass
-		results = await asyncio.gather(*(
-			closer.close()
-			for closer in (self._ws, self._session)
-			if closer
-		), return_exceptions=True)
-		if errors := tuple(
-			result for result in results
-			if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
-		):
-			raise BaseExceptionGroup("Error closing Kinesis session", errors)
+			async with asyncio.TaskGroup() as task_group:
+				task_group.create_task(send_kinesis_candidates())
+				task_group.create_task(receive_kinesis_messages())

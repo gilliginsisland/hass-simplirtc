@@ -16,20 +16,21 @@ from aiortc.mediastreams import MediaStreamTrack
 from aiortc.sdp import candidate_from_sdp
 from av.video.frame import VideoFrame
 from PIL.Image import Image
-from webrtc_models import RTCIceCandidate, RTCIceCandidateInit
 
 DEFAULT_SNAPSHOT_TIMEOUT = 15
 
 
-def _candidate_from_init(
-	candidate: RTCIceCandidate | RTCIceCandidateInit,
+def _ice_candidate_from_sdp(
+	candidate: str,
+	*,
+	sdp_mid: str | None = None,
+	sdp_m_line_index: int | None = None,
 ) -> AiortcIceCandidate | None:
-	if not candidate.candidate:
+	if not candidate:
 		return None
-	aiortc_candidate = candidate_from_sdp(candidate.candidate.removeprefix("candidate:"))
-	if isinstance(candidate, RTCIceCandidateInit):
-		aiortc_candidate.sdpMid = candidate.sdp_mid
-		aiortc_candidate.sdpMLineIndex = candidate.sdp_m_line_index
+	aiortc_candidate = candidate_from_sdp(candidate.removeprefix("candidate:"))
+	aiortc_candidate.sdpMid = sdp_mid
+	aiortc_candidate.sdpMLineIndex = sdp_m_line_index
 	return aiortc_candidate
 
 
@@ -49,7 +50,7 @@ class Snapshotter:
 		self._pc = RTCPeerConnection()
 		self.session_id = f"snapshot-{uuid4().hex}"
 		self._frame_future: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
-		self._remote_candidates: list[RTCIceCandidate | RTCIceCandidateInit] = []
+		self._remote_candidates: list[AiortcIceCandidate | None] = []
 		self._remote_description_ready = asyncio.Event()
 		self._closed = False
 		self._pc.on("track", self._on_track)
@@ -77,13 +78,13 @@ class Snapshotter:
 		if err := task.exception():
 			self._frame_future.set_exception(err)
 
-	async def _add_remote_candidate(self, candidate: RTCIceCandidate | RTCIceCandidateInit) -> None:
+	async def _add_remote_candidate(self, candidate: AiortcIceCandidate | None) -> None:
 		if self._closed:
 			return
 		if not self._remote_description_ready.is_set():
 			self._remote_candidates.append(candidate)
 			return
-		await self._pc.addIceCandidate(_candidate_from_init(candidate))
+		await self._pc.addIceCandidate(candidate)
 
 	async def _set_remote_answer(self, answer_sdp: str) -> None:
 		if self._closed:
@@ -91,7 +92,7 @@ class Snapshotter:
 		await self._pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
 		self._remote_description_ready.set()
 		for candidate in self._remote_candidates:
-			await self._pc.addIceCandidate(_candidate_from_init(candidate))
+			await self._pc.addIceCandidate(candidate)
 		self._remote_candidates.clear()
 
 	def send_answer(self, answer_sdp: str) -> None:
@@ -99,9 +100,19 @@ class Snapshotter:
 		task = asyncio.create_task(self._set_remote_answer(answer_sdp))
 		task.add_done_callback(self._fail_frame_on_task_error)
 
-	def send_candidate(self, candidate: RTCIceCandidate | RTCIceCandidateInit) -> None:
+	def send_candidate(
+		self,
+		candidate: str,
+		*,
+		sdp_mid: str | None = None,
+		sdp_m_line_index: int | None = None,
+	) -> None:
 		"""Apply a WebRTC candidate from the upstream camera session."""
-		task = asyncio.create_task(self._add_remote_candidate(candidate))
+		task = asyncio.create_task(self._add_remote_candidate(_ice_candidate_from_sdp(
+			candidate,
+			sdp_mid=sdp_mid,
+			sdp_m_line_index=sdp_m_line_index,
+		)))
 		task.add_done_callback(self._fail_frame_on_task_error)
 
 	async def _read_video_frame(self, track: MediaStreamTrack) -> None:

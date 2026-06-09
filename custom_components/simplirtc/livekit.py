@@ -11,7 +11,6 @@ from typing import (
 	Any,
 	Literal,
 	overload,
-	override,
 )
 from urllib.parse import urlencode
 
@@ -21,13 +20,9 @@ from aiohttp import (
 	WSMsgType,
 )
 from aiortc import (
-	RTCConfiguration,
-	RTCIceCandidate,
 	RTCIceServer,
 	RTCSessionDescription,
 )
-from aiortc.sdp import candidate_from_sdp
-from webrtc_models import RTCIceCandidateInit
 
 from .protobufs.livekit_rtc_pb2 import (
 	JoinResponse,
@@ -38,8 +33,11 @@ from .protobufs.livekit_rtc_pb2 import (
 	SignalTarget,
 	TrickleRequest,
 )
-from .rtp_router import RawRtpBridge, RawRtpPeerConnection
-from .session import Session
+from .rtp_router import RawRtpPeerConnection
+from .sfu import (
+	ProducerTeardown,
+	ice_candidate_from_sdp,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,7 +51,7 @@ LiveKitOfferCallback = Callable[[SessionDescription], Coroutine[Any, Any, RTCSes
 LiveKitTrickleCallback = Callable[[TrickleRequest], Coroutine[Any, Any, None]]
 LiveKitCloseCallback = Callable[[], None]
 LiveKitEvent = Literal["join", "offer", "trickle", "close"]
-SendAnswer = Callable[[str], None]
+GetLiveKitConnectionInfo = Callable[[], Coroutine[Any, Any, tuple[str, str]]]
 
 
 class LiveKitEngine:
@@ -62,14 +60,11 @@ class LiveKitEngine:
 	def __init__(
 		self,
 		*,
-		session_id: str,
 		livekit_url: str,
 		user_token: str,
 	) -> None:
-		self._session = ClientSession()
-		self._ws: ClientWebSocketResponse | None = None
-		self._tasks: set[asyncio.Task[None]] = set()
-		self._logger = _LOGGER.getChild(f"engine.{session_id}")
+		self._reader_task: asyncio.Task[None] | None = None
+		self._logger = _LOGGER.getChild("engine")
 
 		self._on_join_callback: LiveKitJoinCallback | None = None
 		self._on_offer_callback: LiveKitOfferCallback | None = None
@@ -112,59 +107,78 @@ class LiveKitEngine:
 
 		return decorator
 
-	async def start(self) -> None:
+	def start(self) -> None:
 		"""Start LiveKit signaling."""
-		try:
-			self._ws = await self._session.ws_connect(self._ws_endpoint)
-			self._start_task(self._read())
-		except Exception as err:
-			self._logger.error("Error in LiveKit engine setup: %s", err)
-			await self.close()
-			raise
+		self._reader_task = task = asyncio.create_task(self._read())
 
-	async def _read(self) -> None:
-		try:
-			assert self._ws, "WebSocket connection not established"
-			async for msg in self._ws:
-				if msg.type != WSMsgType.BINARY:
-					raise RuntimeError(f"LiveKit sent non-binary signaling message type={msg.type}")
-
+		def log_task_error(task: asyncio.Task[None]) -> None:
+			if self._reader_task is task:
+				self._reader_task = None
+			if not task.cancelled():
 				try:
-					response = SignalResponse.FromString(msg.data)
-				except Exception as err:
-					self._logger.error("Error parsing LiveKit SignalResponse: %s", err)
-					continue
+					task.result()
+				except BaseException as err:
+					self._logger.error("Error in LiveKit engine: %s", err)
 
-				match kind := response.WhichOneof("message"):
-					case "join":
-						await self._on_join(response.join)
-					case "offer":
-						await self._on_offer(response.offer)
-					case "trickle":
-						await self._on_livekit_trickle(response.trickle)
-					case "update":
-						self._logger.debug("LiveKit participant update ignored")
-					case "leave":
-						self._logger.debug(
-							"LiveKit requested session leave: reason=%s action=%s can_reconnect=%s",
-							response.leave.reason,
-							response.leave.action,
-							response.leave.can_reconnect,
-						)
-						break
-					case "pong_resp":
-						self._logger.debug("LiveKit pong timestamp=%s", response.pong_resp.timestamp)
-					case _:
-						self._logger.debug("LiveKit signaling message kind=%s", kind)
-		except asyncio.CancelledError:
-			raise
-		except Exception as err:
-			self._logger.error("Error in LiveKit WebSocket read loop: %s", err)
-		finally:
+		def on_close(_: asyncio.Task[None]):
 			if callback := self._on_close_callback:
 				callback()
 
-	async def _on_join(self, join: JoinResponse) -> None:
+		task.add_done_callback(log_task_error)
+		task.add_done_callback(on_close)
+
+	async def _read(self) -> None:
+		async with (
+			ClientSession() as session,
+			session.ws_connect(self._ws_endpoint) as ws,
+		):
+			async with asyncio.TaskGroup() as task_group:
+				await self._read_messages(ws, task_group)
+
+	async def _read_messages(
+		self,
+		ws: ClientWebSocketResponse,
+		task_group: asyncio.TaskGroup,
+	) -> None:
+		async for msg in ws:
+			if msg.type != WSMsgType.BINARY:
+				raise RuntimeError(f"LiveKit sent non-binary signaling message type={msg.type}")
+
+			try:
+				response = SignalResponse.FromString(msg.data)
+			except Exception as err:
+				self._logger.error("Error parsing LiveKit SignalResponse: %s", err)
+				continue
+
+			match kind := response.WhichOneof("message"):
+				case "join":
+					await self._on_join(response.join, ws, task_group)
+				case "offer":
+					await self._on_offer(response.offer, ws)
+				case "trickle":
+					await self._on_livekit_trickle(response.trickle)
+				case "update":
+					self._logger.debug("LiveKit participant update ignored")
+				case "leave":
+					self._logger.debug(
+						"LiveKit requested session leave: reason=%s action=%s can_reconnect=%s",
+						response.leave.reason,
+						response.leave.action,
+						response.leave.can_reconnect,
+					)
+					break
+				case "pong_resp":
+					self._logger.debug("LiveKit pong timestamp=%s", response.pong_resp.timestamp)
+				case _:
+					self._logger.debug("LiveKit signaling message kind=%s", kind)
+		raise asyncio.CancelledError
+
+	async def _on_join(
+		self,
+		join: JoinResponse,
+		ws: ClientWebSocketResponse,
+		task_group: asyncio.TaskGroup,
+	) -> None:
 		self._logger.debug(
 			"LiveKit join accepted: room=%s participant=%s subscriber_primary=%s fast_publish=%s server_version=%s server_region=%s",
 			join.room.name or join.room.sid,
@@ -175,14 +189,19 @@ class LiveKitEngine:
 			join.server_region or join.server_info.region,
 		)
 
-		if not (callback := self._on_join_callback):
-			return
-		await callback(join)
+		if (callback := self._on_join_callback):
+			await callback(join)
+
 		if join.ping_interval <= 0:
 			raise RuntimeError(f"LiveKit join had invalid ping_interval={join.ping_interval}")
-		self._start_task(self._ping_loop(join.ping_interval))
 
-	async def _on_offer(self, offer: SessionDescription) -> None:
+		task_group.create_task(self._ping_loop(ws, join.ping_interval))
+
+	async def _on_offer(
+		self,
+		offer: SessionDescription,
+		ws: ClientWebSocketResponse,
+	) -> None:
 		self._logger.debug(
 			"Received LiveKit offer id=%s type=%s",
 			offer.id,
@@ -192,15 +211,13 @@ class LiveKitEngine:
 			return
 		answer = await callback(offer)
 
-		assert self._ws, f"Cannot send LiveKit SDP answer id={offer.id} because WebSocket is closed"
-
 		request = SignalRequest(answer=SessionDescription(
 			type=answer.type,
 			sdp=answer.sdp,
 			id=offer.id,
 		))
 		self._logger.debug("Sending LiveKit answer id=%s", offer.id)
-		await self._ws.send_bytes(request.SerializeToString())
+		await ws.send_bytes(request.SerializeToString())
 
 	async def _on_livekit_trickle(self, trickle: TrickleRequest) -> None:
 		if trickle.target != SignalTarget.SUBSCRIBER:
@@ -210,109 +227,44 @@ class LiveKitEngine:
 			return
 		await callback(trickle)
 
-	def _start_task(self, coroutine: Coroutine[Any, Any, None]) -> None:
-		task = asyncio.create_task(coroutine)
-		self._tasks.add(task)
-
-	async def _ping_loop(self, interval_seconds: int) -> None:
+	async def _ping_loop(
+		self,
+		ws: ClientWebSocketResponse,
+		interval_seconds: int,
+	) -> None:
 		while True:
 			await asyncio.sleep(interval_seconds)
-			if not self._ws or self._ws.closed:
+			if ws.closed:
 				return
 			request = SignalRequest(ping_req=Ping(timestamp=int(time.time() * 1000)))
-			await self._ws.send_bytes(request.SerializeToString())
+			await ws.send_bytes(request.SerializeToString())
 
-	async def close(self) -> None:
+	def close(self) -> None:
 		"""Close this LiveKit engine."""
-		tasks = tuple(self._tasks)
-		self._tasks.clear()
-		ws, self._ws = self._ws, None
-		for task in tasks:
-			task.cancel()
-
-		results = await asyncio.gather(
-			*tasks,
-			*(closer.close() for closer in (ws, self._session) if closer),
-			return_exceptions=True,
-		)
-		if errors := tuple(
-			result for result in results
-			if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
-		):
-			raise BaseExceptionGroup("Error closing LiveKit engine", errors)
-		self._logger.debug("Closed LiveKit engine")
+		if self._reader_task:
+			self._reader_task.cancel()
 
 
-class LiveKitSession(Session):
-	"""Native LiveKit WebRTC proxy session."""
+class LiveKitProducer:
+	"""Configure a raw RTP producer peer connection through LiveKit signaling."""
 
-	def __init__(
-		self,
-		*,
-		session_id: str,
-		send_answer: SendAnswer,
-		livekit_url: str,
-		user_token: str,
-	) -> None:
-		super().__init__()
-		self._session_id = session_id
-		self._send_answer = send_answer
-		self._logger = _LOGGER.getChild(f"session.{session_id}")
-		self._consumer_media_kinds: tuple[str, ...] = ()
-		self._rtc_configuration = RTCConfiguration()
-		self._rtc_configuration_ready = asyncio.Event()
-		self._consumer_remote_description_ready = asyncio.Event()
-		self._producer_remote_description_ready = asyncio.Event()
-		self._producer_ready = asyncio.Event()
-		self._rtp_bridge = RawRtpBridge()
-		self._consumer_pc = RawRtpPeerConnection(
-			bridge=self._rtp_bridge,
-			side="consumer",
-			configuration=self._rtc_configuration,
-		)
-		self._producer_pc = RawRtpPeerConnection(
-			bridge=self._rtp_bridge,
-			side="producer",
-			configuration=self._rtc_configuration,
-		)
+	def __init__(self, *, get_connection_info: GetLiveKitConnectionInfo) -> None:
+		self._get_connection_info = get_connection_info
+		self._logger = _LOGGER.getChild("producer")
 
-		@self._consumer_pc.on("connectionstatechange")
-		async def on_connectionstatechange() -> None:
-			state = self._consumer_pc.connectionState
-			self._logger.debug("Consumer connectionState=%s", state)
-			if state in {"failed", "closed"}:
-				self.close()
-
-		@self._consumer_pc.on("iceconnectionstatechange")
-		async def on_iceconnectionstatechange() -> None:
-			state = self._consumer_pc.iceConnectionState
-			self._logger.debug("Consumer iceConnectionState=%s", state)
-			if state == "failed":
-				self.close()
-
-		@self._producer_pc.on("connectionstatechange")
-		async def on_producer_connectionstatechange() -> None:
-			state = self._producer_pc.connectionState
-			self._logger.debug("Producer connectionState=%s", state)
-			if state in {"failed", "closed"}:
-				self.close()
-
-		@self._producer_pc.on("iceconnectionstatechange")
-		async def on_producer_iceconnectionstatechange() -> None:
-			state = self._producer_pc.iceConnectionState
-			self._logger.debug("Producer iceConnectionState=%s", state)
-			if state == "failed":
-				self.close()
-
-		self._engine = LiveKitEngine(
-			session_id=session_id,
+	async def setup(self, producer_pc: RawRtpPeerConnection) -> ProducerTeardown:
+		"""Start LiveKit signaling and configure the supplied producer PC."""
+		livekit_url, user_token = await self._get_connection_info()
+		engine = LiveKitEngine(
 			livekit_url=livekit_url,
 			user_token=user_token,
 		)
+		rtc_configuration_ready = asyncio.Event()
+		producer_remote_description_ready = asyncio.Event()
 
-		@self._engine.on("join")
+		@engine.on("join")
 		async def on_livekit_join(join: JoinResponse) -> None:
-			self._rtc_configuration.iceServers = [
+			producer_pc.rtc_configuration.iceServers = [
 				RTCIceServer(
 					urls=list(server.urls),
 					username=server.username or None,
@@ -320,35 +272,24 @@ class LiveKitSession(Session):
 				)
 				for server in join.ice_servers
 			]
-			self._rtc_configuration_ready.set()
+			rtc_configuration_ready.set()
 
-		@self._engine.on("offer")
+		@engine.on("offer")
 		async def answer_producer_offer(offer: SessionDescription) -> RTCSessionDescription:
-			await self._wait(self._rtc_configuration_ready)
-			await self._wait(self._consumer_remote_description_ready)
+			await rtc_configuration_ready.wait()
+			await producer_pc.setRemoteDescription(RTCSessionDescription(sdp=offer.sdp, type=offer.type))
+			producer_remote_description_ready.set()
+			await producer_pc.setLocalDescription()
+			if not (local_description := producer_pc.localDescription):
+				raise RuntimeError("LiveKit producer PC did not create an SDP answer")
+			return local_description
 
-			await self._producer_pc.setRemoteDescription(RTCSessionDescription(sdp=offer.sdp, type=offer.type))
-			self._producer_remote_description_ready.set()
-
-			for kind in self._producer_pc.remote_media_kinds():
-				if consumer_codecs := self._consumer_pc.remote_supported_codecs(kind):
-					self._producer_pc.constrain_answer_codecs(kind, consumer_codecs)
-
-			await self._producer_pc.setLocalDescription()
-			assert self._producer_pc.localDescription
-			if all(
-				kind in self._producer_pc.remote_media_kinds()
-				for kind in self._consumer_media_kinds
-			):
-				self._producer_ready.set()
-			return self._producer_pc.localDescription
-
-		@self._engine.on("trickle")
+		@engine.on("trickle")
 		async def add_producer_candidate(trickle: TrickleRequest) -> None:
-			await self._wait(self._producer_remote_description_ready)
+			await producer_remote_description_ready.wait()
 			if trickle.final and not trickle.candidateInit:
 				self._logger.debug("Producer end-of-candidates")
-				await self._producer_pc.addIceCandidate(None)
+				await producer_pc.addIceCandidate(None)
 				return
 			if not trickle.candidateInit:
 				raise RuntimeError("Producer sent a non-final ICE candidate without candidateInit")
@@ -360,87 +301,28 @@ class LiveKitSession(Session):
 				raise RuntimeError(f"Producer ICE candidate has invalid sdpMid field: {init}")
 			if not isinstance(sdp_m_line_index := init["sdpMLineIndex"], int):
 				raise RuntimeError(f"Producer ICE candidate has invalid sdpMLineIndex field: {init}")
-			candidate = _candidate_from_init(candidate_init)
-			candidate.sdpMid = sdp_mid
-			candidate.sdpMLineIndex = sdp_m_line_index
+			if not (candidate := ice_candidate_from_sdp(
+				candidate_init,
+				sdp_mid=sdp_mid,
+				sdp_m_line_index=sdp_m_line_index,
+			)):
+				return
 			self._logger.debug(
 				"Adding producer ICE candidate mid=%s index=%s type=%s",
 				candidate.sdpMid,
 				candidate.sdpMLineIndex,
 				candidate.type,
 			)
-			await self._producer_pc.addIceCandidate(candidate)
+			await producer_pc.addIceCandidate(candidate)
 
-		@self._engine.on("close")
+		@engine.on("close")
 		def on_livekit_close() -> None:
-			self.close()
+			asyncio.create_task(producer_pc.close())
 
-	@override
-	async def _stream(self, offer_sdp: str) -> None:
-		"""Answer a consumer offer using ready LiveKit media."""
-		await self._engine.start()
-		await self._wait(self._rtc_configuration_ready)
-		await self._consumer_pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
-		if not (consumer_media_kinds := self._consumer_pc.remote_media_kinds()):
-			raise RuntimeError("Consumer offer has no media sections")
-		self._consumer_media_kinds = consumer_media_kinds
-		if unsupported := tuple(
-			kind for kind in self._consumer_media_kinds
-			if not self._consumer_pc.remote_supported_codecs(kind)
-		):
-			raise RuntimeError(
-				f"Consumer offer contains unsupported media types: {', '.join(unsupported)}"
-			)
-		self._consumer_remote_description_ready.set()
-		await self._wait(self._producer_ready)
-		for kind in self._consumer_media_kinds:
-			self._consumer_pc.set_answer_direction(kind, "sendonly")
-		await self._consumer_pc.setLocalDescription()
-		assert self._consumer_pc.localDescription
-		self._send_answer(self._consumer_pc.localDescription.sdp)
-
-	@override
-	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
-		"""Handle an ICE candidate from the consumer."""
-		await self._wait(self._consumer_remote_description_ready)
-		if not candidate.candidate:
-			self._logger.debug("Consumer end-of-candidates")
-			await self._consumer_pc.addIceCandidate(None)
-			return
-
+		engine.start()
 		try:
-			aiortc_candidate = _candidate_from_init(candidate.candidate)
-			aiortc_candidate.sdpMid = candidate.sdp_mid
-			aiortc_candidate.sdpMLineIndex = candidate.sdp_m_line_index
-		except Exception as err:
-			self._logger.error("Failed to parse consumer ICE candidate: %s", err)
-			return
-
-		self._logger.debug(
-			"Adding consumer ICE candidate mid=%s index=%s type=%s",
-			aiortc_candidate.sdpMid,
-			aiortc_candidate.sdpMLineIndex,
-			aiortc_candidate.type,
-		)
-		await self._consumer_pc.addIceCandidate(aiortc_candidate)
-
-	@override
-	async def _close(self) -> None:
-		"""Close this producer and consumer WebRTC session."""
-		results = await asyncio.gather(
-			self._engine.close(),
-			self._producer_pc.close(),
-			self._consumer_pc.close(),
-			return_exceptions=True,
-		)
-		if errors := tuple(
-			result for result in results
-			if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
-		):
-			raise BaseExceptionGroup("Error closing LiveKit proxy session", errors)
-		self._logger.debug("Closed LiveKit proxy session")
-
-
-def _candidate_from_init(candidate: str) -> RTCIceCandidate:
-	"""Parse RTCIceCandidateInit.candidate text for aiortc."""
-	return candidate_from_sdp(candidate.removeprefix("candidate:"))
+			await rtc_configuration_ready.wait()
+		except BaseException:
+			engine.close()
+			raise
+		return engine.close
