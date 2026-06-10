@@ -64,7 +64,6 @@ _RTP_SUBSCRIPTION_QUEUE_SIZE = 90
 class RtpInput:
 	"""Negotiated RTP stream expected from a remote endpoint."""
 
-	side: Side
 	peer_id: PeerId
 	kind: str
 	mid: str
@@ -88,9 +87,6 @@ class RtpInput:
 			return
 		if self.primary_ssrc is None:
 			self.primary_ssrc = packet.ssrc
-
-	def is_rtx_ssrc(self, ssrc: int) -> bool:
-		return self.rtx_ssrc == ssrc
 
 	def subscribe(self, output: RtpOutput) -> None:
 		"""Subscribe a consumer output to this producer input."""
@@ -161,7 +157,6 @@ class RtpInput:
 class RtpOutput:
 	"""Negotiated RTP stream we advertise to a remote endpoint."""
 
-	side: Side
 	peer_id: PeerId
 	kind: str
 	mid: str
@@ -479,7 +474,6 @@ class RawRtpProducer:
 		if existing_input := self._inputs_by_kind.get(kind):
 			existing_input.close()
 		rtp_input = self._inputs_by_kind[kind] = self._create_input(
-			side=side,
 			peer_id=peer_id,
 			kind=kind,
 			receiver=receiver,
@@ -510,7 +504,6 @@ class RawRtpProducer:
 		if side != "consumer":
 			return
 		output = self._create_output(
-			side=side,
 			peer_id=peer_id,
 			kind=kind,
 			transport=transport,
@@ -570,7 +563,6 @@ class RawRtpProducer:
 	def _create_input(
 		self,
 		*,
-		side: Side,
 		peer_id: PeerId,
 		kind: str,
 		receiver: RawRtpReceiver,
@@ -587,9 +579,8 @@ class RawRtpProducer:
 				rtx_ssrc = rtx.ssrc
 		transport = receiver.transport
 		if not isinstance(transport, RawRtpDtlsTransport):
-			raise RuntimeError(f"Raw RTP input for {side} {kind} has non-raw transport")
+			raise RuntimeError(f"Raw RTP input for {kind} has non-raw transport")
 		return RtpInput(
-			side=side,
 			peer_id=peer_id,
 			kind=kind,
 			mid=parameters.muxId,
@@ -604,7 +595,6 @@ class RawRtpProducer:
 	def _create_output(
 		self,
 		*,
-		side: Side,
 		peer_id: PeerId,
 		kind: str,
 		transport: RawRtpDtlsTransport,
@@ -614,7 +604,6 @@ class RawRtpProducer:
 		header_extensions = HeaderExtensionsMap()
 		header_extensions.configure(parameters)
 		return RtpOutput(
-			side=side,
 			peer_id=peer_id,
 			kind=kind,
 			mid=parameters.muxId,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
+from contextlib import suppress
 import logging
 from typing import Any
 import uuid
@@ -156,41 +157,15 @@ class RawRtpSfu:
 			self.close_consumer(consumer)
 
 	def close_consumer(self, consumer: RawRtpPeerConnection) -> None:
-		"""Close a consumer session if it is still the current session for its peer ID."""
-		if self._consumers.get(consumer.peer_id) is not consumer:
-			return
-		del self._consumers[consumer.peer_id]
+		"""Close a consumer session."""
+		self._consumers.pop(consumer.peer_id, None)
 		self._pending_consumer_candidates.pop(consumer.peer_id, None)
-
-		def _log_close_error(task: asyncio.Task[None]) -> None:
-			if task.cancelled():
-				return
-			try:
-				task.result()
-			except BaseException as err:
-				self._logger.error(
-					"Error closing raw RTP SFU consumer %s: %s",
-					consumer.peer_id,
-					err,
-				)
-
-		close_task = asyncio.create_task(consumer.close())
-		close_task.add_done_callback(_log_close_error)
+		asyncio.create_task(consumer.close())
 
 		if self._consumers or not self._producer_pc or self._idle_task:
 			return
 
-		self._idle_task = idle_task = asyncio.create_task(self._close_when_idle())
-
-		def _log_idle_close_error(task: asyncio.Task[None]) -> None:
-			if task.cancelled():
-				return
-			try:
-				task.result()
-			except BaseException as err:
-				self._logger.error("Error closing idle raw RTP SFU producer: %s", err)
-
-		idle_task.add_done_callback(_log_idle_close_error)
+		self._idle_task = asyncio.create_task(self._close_when_idle())
 
 	async def _ensure_producer(self) -> None:
 		if self._producer_pc and self._producer_teardown:
@@ -215,17 +190,7 @@ class RawRtpSfu:
 			self._logger.debug("Producer connectionState=%s", state)
 			if self._producer_pc is not producer_pc or state not in {"failed", "closed"}:
 				return
-			task = asyncio.create_task(self._close_failed_producer(producer_pc))
-
-			def log_task_error(task: asyncio.Task[None]) -> None:
-				if task.cancelled():
-					return
-				try:
-					task.result()
-				except BaseException as err:
-					self._logger.error("Error closing failed raw RTP SFU producer: %s", err)
-
-			task.add_done_callback(log_task_error)
+			asyncio.create_task(self._close_failed_producer(producer_pc))
 
 		try:
 			producer_teardown = await self._setup_producer_pc(producer_pc)
@@ -255,22 +220,13 @@ class RawRtpSfu:
 	async def close(self) -> None:
 		"""Close the producer and all consumers."""
 		async with self._close_lock:
-			consumers = []
-			for peer_id, consumer in tuple(self._consumers.items()):
-				if self._consumers.get(peer_id) is consumer:
-					del self._consumers[peer_id]
-					self._pending_consumer_candidates.pop(peer_id, None)
-					consumers.append(consumer)
-			results = await asyncio.gather(
+			consumers = tuple(self._consumers.values())
+			self._consumers.clear()
+			self._pending_consumer_candidates.clear()
+			await asyncio.gather(
 				*(consumer.close() for consumer in consumers),
-				return_exceptions=True,
+				self._close_producer(),
 			)
-			results += await self._close_producer()
-			if errors := tuple(
-				result for result in results
-				if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
-			):
-				raise BaseExceptionGroup("Error closing raw RTP SFU", errors)
 			self._logger.debug("Closed raw RTP SFU")
 
 	async def _close_when_idle(self) -> None:
@@ -278,8 +234,8 @@ class RawRtpSfu:
 		if not self._consumers:
 			await self._close_producer()
 
-	async def _close_producer(self) -> tuple[BaseException | None, ...]:
-		"""Close the current producer and return cleanup results."""
+	async def _close_producer(self) -> None:
+		"""Close the current producer."""
 		if (idle_task := self._idle_task) and idle_task is not asyncio.current_task():
 			idle_task.cancel()
 		self._idle_task = None
@@ -287,24 +243,13 @@ class RawRtpSfu:
 		producer_pc, self._producer_pc = self._producer_pc, None
 		producer_task, self._producer_setup_task = self._producer_setup_task, None
 		producer_teardown, self._producer_teardown = self._producer_teardown, None
-		results: list[BaseException | None] = []
 
 		if producer_task:
-			if not producer_task.done():
-				producer_task.cancel()
-			try:
+			producer_task.cancel()
+			with suppress(asyncio.CancelledError):
 				await producer_task
-			except BaseException as err:
-				results.append(err)
 
 		if producer_teardown:
-			try:
-				producer_teardown()
-			except BaseException as err:
-				results.append(err)
+			producer_teardown()
 		if producer_pc:
-			try:
-				await producer_pc.close()
-			except BaseException as err:
-				results.append(err)
-		return tuple(results)
+			await producer_pc.close()
