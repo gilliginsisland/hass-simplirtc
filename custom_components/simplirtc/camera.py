@@ -10,7 +10,6 @@ from typing import Any, TypeVar, override
 
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
-from propcache import cached_property
 from simplipy.device.camera import Camera
 from simplipy.system.v3 import SystemV3
 from simplipy.websocket import (
@@ -34,10 +33,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from webrtc_models import RTCIceCandidateInit
 
 from .const import (
-	DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
 )
 from .kinesis import KinesisSession
+from .livekit import LiveKitProducer
+from .sfu import RawRtpSfu
 
 _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
@@ -69,20 +69,17 @@ async def async_setup_entry(
 			continue
 
 		for camera in system.cameras.values():
-			if not isinstance(settings := camera.camera_settings.get('admin'), Mapping):
-				_LOGGER.warning(f"Skipping camera '{camera.name}'. Unexpected settings schema.")
+			if not isinstance(settings := camera.camera_settings.get("admin"), Mapping):
+				_LOGGER.warning("Skipping camera '%s'. Unexpected settings schema.", camera.name)
 				continue
 
-			match settings.get('webRTCProvider', None):
-				case 'mist':
+			match settings.get("webRTCProvider"):
+				case "mist":
 					cls = SimpliSafeLiveKitCamera
-					if not hass.data[DOMAIN]:
-						_LOGGER.warning(f"Camera '{camera.name}' requires livekit and no proxy addon is configured")
-						continue
-				case 'kvs':
+				case "kvs":
 					cls = SimpliSafeKenisisCamera
 				case _ as provider:
-					_LOGGER.warning(f"Camera '{camera.name}' has unknown webrtc provider '{provider}'")
+					_LOGGER.warning("Camera '%s' has unknown webrtc provider '%s'", camera.name, provider)
 					continue
 
 			cameras.append(cls(simplisafe, system, camera))
@@ -137,7 +134,6 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 			await self._simplisafe._api.async_request("get", path, url_base=WEBRTC_URL_BASE)  # pyright: ignore[reportPrivateUsage]
 		)
 
-
 class SimpliSafeLiveKitCamera(SimpliSafeCamera):
 	"""An implementation of a Simplisafe camera."""
 
@@ -147,17 +143,39 @@ class SimpliSafeLiveKitCamera(SimpliSafeCamera):
 		self._livekit_token: str = ""
 		self._cache_expiration: float = 0
 		self._lock = asyncio.Lock()
+		self._livekit_producer = LiveKitProducer(get_connection_info=self._live_view)
+		self._sfu = RawRtpSfu(
+			setup_producer_pc=self._livekit_producer.setup,
+		)
 
-	@cached_property
-	def use_stream_for_stills(self) -> bool:
-		"""Whether or not to use stream to generate stills."""
-		return True
+	@override
+	async def async_handle_async_webrtc_offer(
+		self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
+	) -> None:
+		"""Handle a WebRTC offer with an immediately available SFU session."""
+		answer_sdp = await self._sfu.create_session(
+			offer_sdp,
+			peer_id=session_id,
+		)
+		send_message(WebRTCAnswer(answer=answer_sdp))
 
-	async def stream_source(self) -> str | None:
-		"""Return the source of the stream."""
+	@override
+	async def async_on_webrtc_candidate(
+		self, session_id: str, candidate: RTCIceCandidateInit
+	) -> None:
+		"""Handle a WebRTC candidate for an SFU consumer."""
+		await self._sfu.add_candidate(
+			session_id,
+			candidate.candidate,
+			sdp_mid=candidate.sdp_mid,
+			sdp_m_line_index=candidate.sdp_m_line_index,
+		)
 
-		url, token = await self._live_view()
-		return f"rtsp://{self.hass.data[DOMAIN]}/{self._device.serial}?url={url}&token={token}"
+	@override
+	@callback
+	def close_webrtc_session(self, session_id: str) -> None:
+		"""Close an SFU consumer WebRTC session."""
+		self._sfu.close_session(session_id)
 
 	async def _live_view(self) -> tuple[str, str]:
 		if time.time() < self._cache_expiration:
@@ -172,9 +190,9 @@ class SimpliSafeLiveKitCamera(SimpliSafeCamera):
 			self._livekit_token = live_view.liveKitDetails.userToken
 			try:
 				decoded_token = jwt.decode(self._livekit_token, options={"verify_signature": False})
-				self._cache_expiration = decoded_token['exp']
-			except Exception as e:
-				_LOGGER.warning(f"Failed to decode JWT token for caching: {e}")
+				self._cache_expiration = decoded_token["exp"]
+			except Exception as err:
+				_LOGGER.warning("Failed to decode JWT token for caching: %s", err)
 				self._cache_expiration = 0
 
 		return self._livekit_url, self._livekit_token
