@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
-from contextlib import suppress
 import logging
 from typing import Any
 import uuid
@@ -18,13 +17,12 @@ from aiortc.sdp import candidate_from_sdp
 
 from .rtp_router import (
 	RawRtpPeerConnection,
-	RawRtpProducer,
+	RawRtpRouter,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-ProducerTeardown = Callable[[], None]
-SetupProducer = Callable[[RawRtpPeerConnection], Coroutine[Any, Any, ProducerTeardown]]
+SetupProducer = Callable[[RawRtpPeerConnection], Coroutine[Any, Any, None]]
 
 
 def ice_candidate_from_sdp(
@@ -54,14 +52,12 @@ class RawRtpSfu:
 		self._setup_producer_pc = setup_producer_pc
 		self._idle_timeout = idle_timeout
 		self._logger = _LOGGER.getChild("sfu")
-		self._rtp_producer = RawRtpProducer()
+		self._rtp_router = RawRtpRouter()
 		self._rtc_configuration = RTCConfiguration()
-		self._close_lock = asyncio.Lock()
 		self._consumers: dict[str, RawRtpPeerConnection] = {}
-		self._pending_consumer_candidates: dict[str, list[RTCIceCandidate | None]] = {}
 		self._producer_pc: RawRtpPeerConnection | None = None
 		self._producer_setup_task: asyncio.Task[None] | None = None
-		self._producer_teardown: ProducerTeardown | None = None
+		self._producer_close_task: asyncio.Task[None] | None = None
 		self._idle_task: asyncio.Task[None] | None = None
 
 	async def create_session(
@@ -74,9 +70,20 @@ class RawRtpSfu:
 		self.close_session(peer_id)
 		self._consumers[peer_id] = consumer = self._create_consumer(peer_id)
 		try:
-			return await self._answer_offer(consumer, offer_sdp)
+			if producer_close_task := self._producer_close_task:
+				await asyncio.shield(producer_close_task)
+				self._producer_close_task = None
+
+			await self._ensure_producer()
+
+			await consumer.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
+			await consumer.add_pending_remote_candidates()
+			await consumer.setLocalDescription()
+			if not (local_description := consumer.localDescription):
+				raise RuntimeError("Consumer peer connection did not create an SDP answer")
+			return local_description.sdp
 		except BaseException:
-			self.close_consumer(consumer)
+			self.close_session(peer_id)
 			raise
 
 	def _create_consumer(self, peer_id: str) -> RawRtpPeerConnection:
@@ -86,10 +93,11 @@ class RawRtpSfu:
 			self._idle_task = None
 
 		consumer = RawRtpPeerConnection(
-			producer=self._rtp_producer,
-			side="consumer",
-			peer_id=peer_id,
 			configuration=self._rtc_configuration,
+		)
+		self._rtp_router.addOutput(
+			consumer,
+			peer_id=peer_id,
 		)
 
 		@consumer.on("connectionstatechange")
@@ -97,7 +105,7 @@ class RawRtpSfu:
 			state = consumer.connectionState
 			self._logger.debug("Consumer %s connectionState=%s", peer_id, state)
 			if state in {"failed", "closed"}:
-				self.close_consumer(consumer)
+				self.close_session(consumer.peer_id)
 
 		return consumer
 
@@ -110,65 +118,33 @@ class RawRtpSfu:
 		sdp_m_line_index: int | None = None,
 	) -> None:
 		"""Add a consumer ICE candidate by peer ID."""
-		if not (consumer := self._consumers.get(peer_id)):
-			self._logger.debug("Ignoring ICE candidate for closed consumer %s", peer_id)
-			return
 		aiortc_candidate = ice_candidate_from_sdp(
 			candidate,
 			sdp_mid=sdp_mid,
 			sdp_m_line_index=sdp_m_line_index,
 		)
-		if not consumer.remoteDescription:
-			self._pending_consumer_candidates.setdefault(peer_id, []).append(aiortc_candidate)
+
+		if consumer := self._consumers.get(peer_id):
+			await consumer.addIceCandidate(aiortc_candidate)
 			return
-		await consumer.addIceCandidate(aiortc_candidate)
 
-	async def _answer_offer(
-		self,
-		consumer: RawRtpPeerConnection,
-		offer_sdp: str,
-	) -> str:
-		"""Answer a consumer peer connection offer."""
-		await self._ensure_producer()
-		await consumer.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
-		for candidate in self._pending_consumer_candidates.pop(consumer.peer_id, ()):
-			await consumer.addIceCandidate(candidate)
-		if not (consumer_media_kinds := consumer.remote_media_kinds()):
-			raise RuntimeError("Consumer offer has no media sections")
-		if unsupported := tuple(
-			kind for kind in consumer_media_kinds
-			if not consumer.remote_supported_codecs(kind)
-		):
-			raise RuntimeError(
-				f"Consumer offer contains unsupported media types: {', '.join(unsupported)}"
-			)
-
-		for kind in consumer_media_kinds:
-			consumer.set_answer_direction(kind, "sendonly")
-		await consumer.setLocalDescription()
-		if not (local_description := consumer.localDescription):
-			raise RuntimeError("Consumer peer connection did not create an SDP answer")
-
-		return local_description.sdp
+		self._logger.debug("Ignoring ICE candidate for closed consumer %s", peer_id)
 
 	def close_session(self, peer_id: str) -> None:
 		"""Close a consumer session by peer ID."""
-		if consumer := self._consumers.get(peer_id):
-			self.close_consumer(consumer)
+		if consumer := self._consumers.pop(peer_id, None):
+			asyncio.create_task(consumer.close())
 
-	def close_consumer(self, consumer: RawRtpPeerConnection) -> None:
-		"""Close a consumer session."""
-		self._consumers.pop(consumer.peer_id, None)
-		self._pending_consumer_candidates.pop(consumer.peer_id, None)
-		asyncio.create_task(consumer.close())
-
-		if self._consumers or not self._producer_pc or self._idle_task:
-			return
-
-		self._idle_task = asyncio.create_task(self._close_when_idle())
+		if (
+			not self._consumers
+			and (self._producer_pc or self._producer_setup_task)
+			and not self._idle_task
+			and not self._producer_close_task
+		):
+			self._idle_task = asyncio.create_task(self._close_when_idle())
 
 	async def _ensure_producer(self) -> None:
-		if self._producer_pc and self._producer_teardown:
+		if self._producer_pc:
 			return
 		if not (producer_task := self._producer_setup_task):
 			producer_task = self._producer_setup_task = asyncio.create_task(self._setup_producer())
@@ -177,79 +153,75 @@ class RawRtpSfu:
 	async def _setup_producer(self) -> None:
 		"""Start a producer peer connection and keep its teardown callback."""
 		producer_peer_id = f"producer-{uuid.uuid4()}"
-		self._producer_pc = producer_pc = RawRtpPeerConnection(
-			producer=self._rtp_producer,
-			side="producer",
-			peer_id=producer_peer_id,
+		producer_pc = RawRtpPeerConnection(
 			configuration=self._rtc_configuration,
 		)
+		self._rtp_router.addInput(
+			producer_pc,
+			peer_id=producer_peer_id,
+		)
+		setup_producer_pc_task: asyncio.Task[None] | None = None
 
 		@producer_pc.on("connectionstatechange")
 		async def on_producer_connectionstatechange() -> None:
+			nonlocal setup_producer_pc_task
 			state = producer_pc.connectionState
 			self._logger.debug("Producer connectionState=%s", state)
-			if self._producer_pc is not producer_pc or state not in {"failed", "closed"}:
+			if state not in {"failed", "closed"}:
 				return
-			asyncio.create_task(self._close_failed_producer(producer_pc))
+			if self._producer_pc is producer_pc:
+				self.close()
+				return
+			if task := setup_producer_pc_task:
+				setup_producer_pc_task = None
+				task.cancel()
+
+		setup_producer_pc_task = asyncio.create_task(self._setup_producer_pc(producer_pc))
 
 		try:
-			producer_teardown = await self._setup_producer_pc(producer_pc)
+			await setup_producer_pc_task
 		except BaseException:
-			if self._producer_pc is producer_pc:
-				self._producer_pc = None
+			setup_producer_pc_task = None
 			await producer_pc.close()
 			raise
 		finally:
-			if self._producer_setup_task is asyncio.current_task():
-				self._producer_setup_task = None
+			self._producer_setup_task = None
 
-		if self._producer_pc is producer_pc:
-			self._producer_teardown = producer_teardown
-			return
-		producer_teardown()
-		await producer_pc.close()
-
-	async def _close_failed_producer(self, producer_pc: RawRtpPeerConnection) -> None:
-		"""Close current consumers when the producer connection stops."""
-		if self._producer_pc is not producer_pc:
-			return
-		await self._close_producer()
-		for consumer in tuple(self._consumers.values()):
-			self.close_consumer(consumer)
-
-	async def close(self) -> None:
-		"""Close the producer and all consumers."""
-		async with self._close_lock:
-			consumers = tuple(self._consumers.values())
-			self._consumers.clear()
-			self._pending_consumer_candidates.clear()
-			await asyncio.gather(
-				*(consumer.close() for consumer in consumers),
-				self._close_producer(),
-			)
-			self._logger.debug("Closed raw RTP SFU")
+		self._producer_pc = producer_pc
 
 	async def _close_when_idle(self) -> None:
 		await asyncio.sleep(self._idle_timeout)
 		if not self._consumers:
-			await self._close_producer()
+			self.close()
+		self._idle_task = None
 
 	async def _close_producer(self) -> None:
 		"""Close the current producer."""
-		if (idle_task := self._idle_task) and idle_task is not asyncio.current_task():
+
+		if consumers := self._consumers:
+			for peer_id, consumer in tuple(consumers.items()):
+				if consumer.remoteDescription:
+					self.close_session(peer_id)
+
+		tasks: list[asyncio.Task[Any]] = []
+
+		if idle_task := self._idle_task:
+			self._idle_task = None
 			idle_task.cancel()
-		self._idle_task = None
+			tasks.append(idle_task)
 
-		producer_pc, self._producer_pc = self._producer_pc, None
-		producer_task, self._producer_setup_task = self._producer_setup_task, None
-		producer_teardown, self._producer_teardown = self._producer_teardown, None
-
-		if producer_task:
+		if producer_task := self._producer_setup_task:
+			self._producer_setup_task = None
 			producer_task.cancel()
-			with suppress(asyncio.CancelledError):
-				await producer_task
+			tasks.append(producer_task)
 
-		if producer_teardown:
-			producer_teardown()
-		if producer_pc:
-			await producer_pc.close()
+		if producer_pc := self._producer_pc:
+			self._producer_pc = None
+			tasks.append(asyncio.create_task(producer_pc.close()))
+
+		await asyncio.gather(*tasks, return_exceptions=True)
+
+	def close(self) -> None:
+		"""Schedule active producer and consumer shutdown."""
+		if not self._producer_close_task:
+			self._producer_close_task = asyncio.create_task(self._close_producer())

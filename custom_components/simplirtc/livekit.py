@@ -35,7 +35,6 @@ from .protobufs.livekit_rtc_pb2 import (
 )
 from .rtp_router import RawRtpPeerConnection
 from .sfu import (
-	ProducerTeardown,
 	ice_candidate_from_sdp,
 )
 
@@ -109,6 +108,7 @@ class LiveKitEngine:
 
 	def start(self) -> None:
 		"""Start LiveKit signaling."""
+
 		self._reader_task = task = asyncio.create_task(self._read())
 
 		def log_task_error(task: asyncio.Task[None]) -> None:
@@ -241,8 +241,9 @@ class LiveKitEngine:
 
 	def close(self) -> None:
 		"""Close this LiveKit engine."""
-		if self._reader_task:
-			self._reader_task.cancel()
+		if reader_task := self._reader_task:
+			self._reader_task = None
+			reader_task.cancel()
 
 
 class LiveKitProducer:
@@ -252,7 +253,7 @@ class LiveKitProducer:
 		self._get_connection_info = get_connection_info
 		self._logger = _LOGGER.getChild("producer")
 
-	async def setup(self, producer_pc: RawRtpPeerConnection) -> ProducerTeardown:
+	async def setup(self, producer_pc: RawRtpPeerConnection) -> None:
 		"""Start LiveKit signaling and configure the supplied producer PC."""
 		livekit_url, user_token = await self._get_connection_info()
 		engine = LiveKitEngine(
@@ -278,6 +279,7 @@ class LiveKitProducer:
 		async def answer_producer_offer(offer: SessionDescription) -> RTCSessionDescription:
 			await rtc_configuration_ready.wait()
 			await producer_pc.setRemoteDescription(RTCSessionDescription(sdp=offer.sdp, type=offer.type))
+			await producer_pc.add_pending_remote_candidates()
 			producer_remote_description_ready.set()
 			await producer_pc.setLocalDescription()
 			if not (local_description := producer_pc.localDescription):
@@ -319,10 +321,14 @@ class LiveKitProducer:
 		def on_livekit_close() -> None:
 			asyncio.create_task(producer_pc.close())
 
+		@producer_pc.on("connectionstatechange")
+		async def on_producer_connectionstatechange() -> None:
+			if producer_pc.connectionState in {"failed", "closed"}:
+				engine.close()
+
 		engine.start()
 		try:
 			await rtc_configuration_ready.wait()
 		except BaseException:
 			engine.close()
 			raise
-		return engine.close
