@@ -48,20 +48,11 @@ _StreamResponseT = TypeVar("_StreamResponseT")
 
 async def async_setup_entry(
 	hass: HomeAssistant,
-	entry: ConfigEntry,
+	entry: ConfigEntry[SimpliSafe],
 	async_add_entities: AddEntitiesCallback,
 ) -> None:
 	"""Set up a SimpliSafe Camera."""
-
-	entry_id: str = entry.data[ATTR_CONFIG_ENTRY_ID]
-
-	_LOGGER.info("Setting up SimpliSafe Camera for entry: %s", entry_id)
-
-	simplisafe_entry: ConfigEntry[SimpliSafe] | None
-	if not (simplisafe_entry := hass.config_entries.async_get_entry(entry_id)):
-		_LOGGER.warning("Missing SimpliSafe entry: %s", entry_id)
-		return
-	simplisafe = simplisafe_entry.runtime_data
+	simplisafe = entry.runtime_data
 
 	cameras: list[SimpliSafeCamera] = []
 

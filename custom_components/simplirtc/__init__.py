@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from homeassistant.const import (
 	Platform,
@@ -23,6 +24,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.components.simplisafe import (
 	DOMAIN as SIMPLISAFE_DOMAIN,
+	SimpliSafe,
 )
 
 from .const import (
@@ -36,6 +38,7 @@ PLATFORMS = [
 ]
 
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -71,9 +74,18 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 	return True
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry[SimpliSafe]) -> bool:
 	"""Set up SimpliSafe from a config entry."""
+	entry_id: str = entry.data[ATTR_CONFIG_ENTRY_ID]
 
+	simplisafe_entry: ConfigEntry[SimpliSafe] | None = (
+		hass.config_entries.async_get_entry(entry_id)
+	)
+	if simplisafe_entry is None:
+		_LOGGER.debug("Skipping setup for missing SimpliSafe entry: %s", entry_id)
+		return False
+
+	entry.runtime_data = simplisafe_entry.runtime_data
 	await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 	return True
 
