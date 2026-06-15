@@ -22,6 +22,12 @@ Add and configure the normal Home Assistant SimpliSafe integration.
 Once the SimpliSafe integration is loaded, SimpliRTC watches for its config
 entries and automatically adds camera support for supported cameras.
 
+SimpliRTC also adds motion event entities for V3 cameras. These entities are
+backed by SimpliSafe websocket motion events, so they do not depend on the
+camera's WebRTC backend. SimpliSafe does not appear to expose a camera
+motion-active API state or a matching motion-clear event, so motion is exposed
+as an event rather than a latched on/off state.
+
 ## Supported Systems
 
 Only SimpliSafe V3 systems are supported. Older system versions are skipped.

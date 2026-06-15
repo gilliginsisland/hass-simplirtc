@@ -35,6 +35,7 @@ from .web import SimpliRTCStreamInfoView
 
 PLATFORMS = [
 	Platform.CAMERA,
+	Platform.EVENT,
 ]
 
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
