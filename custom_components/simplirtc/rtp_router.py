@@ -7,34 +7,21 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 import logging
-from typing import (
-	Any,
-	cast,
-	override,
-)
 
-from aiortc import (
-	RTCBundlePolicy,
-	RTCCertificate,
+from .vendor.aiortc import (
 	RTCConfiguration,
 	RTCDtlsTransport,
-	RTCIceCandidate,
-	RTCIceGatherer,
-	RTCIceTransport,
 	RTCPeerConnection,
-	RTCRtpReceiver,
 	RTCRtpSender,
-	RTCRtpTransceiver,
 )
-from aiortc.codecs import is_rtx
-from aiortc.mediastreams import MediaStreamTrack
-from aiortc.rtcpeerconnection import is_codec_compatible
-from aiortc.rtcrtpparameters import (
+from .vendor.aiortc.codecs import is_rtx
+from .vendor.aiortc.rtcpeerconnection import is_codec_compatible
+from .vendor.aiortc.rtcrtpparameters import (
 	RTCRtpCodecParameters,
 	RTCRtpReceiveParameters,
 	RTCRtpSendParameters,
 )
-from aiortc.rtp import (
+from .vendor.aiortc.rtp import (
 	AnyRtcpPacket,
 	HeaderExtensionsMap,
 	RTCP_PSFB_APP,
@@ -64,7 +51,7 @@ class RtpInput:
 
 	peer_id: PeerId
 	kind: MediaKind
-	transport: RawRtpDtlsTransport
+	transport: RTCDtlsTransport
 	local_rtcp_ssrc: int | None
 	parameters: RTCRtpReceiveParameters
 	header_extensions: HeaderExtensionsMap = field(init=False)
@@ -99,17 +86,17 @@ class RtpOutput:
 	"""Negotiated RTP stream we advertise to a remote endpoint."""
 
 	peer_id: PeerId
-	sender: RawRtpSender
+	sender: RTCRtpSender
 	parameters: RTCRtpSendParameters
 	kind: MediaKind = field(init=False)
 	mid: str = field(init=False)
-	transport: RawRtpDtlsTransport = field(init=False)
+	transport: RTCDtlsTransport = field(init=False)
 	header_extensions: HeaderExtensionsMap = field(init=False)
 
 	def __post_init__(self) -> None:
 		transport = self.sender.transport
-		if not isinstance(transport, RawRtpDtlsTransport):
-			raise RuntimeError(f"Raw RTP output for {self.sender.kind} has non-raw transport")
+		if not isinstance(transport, RTCDtlsTransport):
+			raise RuntimeError(f"Raw RTP output for {self.sender.kind} has unexpected transport")
 		header_extensions = HeaderExtensionsMap()
 		header_extensions.configure(self.parameters)
 
@@ -457,7 +444,7 @@ class RawRtpTrack:
 	def rewrite_rtcp_from_input(
 		self,
 		packet: AnyRtcpPacket,
-	) -> tuple[tuple[RawRtpDtlsTransport, AnyRtcpPacket], ...]:
+	) -> tuple[tuple[RTCDtlsTransport, AnyRtcpPacket], ...]:
 		"""Rewrite producer RTCP for all subscribers."""
 		routes = []
 		for subscription in tuple(self._subscriptions.values()):
@@ -469,7 +456,7 @@ class RawRtpTrack:
 		self,
 		peer_id: PeerId,
 		packet: AnyRtcpPacket,
-	) -> tuple[tuple[RawRtpDtlsTransport, AnyRtcpPacket], ...]:
+	) -> tuple[tuple[RTCDtlsTransport, AnyRtcpPacket], ...]:
 		"""Rewrite subscriber RTCP feedback for this input."""
 		if not (subscription := self._subscriptions.get(peer_id)):
 			return ()
@@ -493,7 +480,7 @@ class RawRtpRouter:
 		peer_id: PeerId,
 	) -> None:
 		"""Register a peer connection as a raw RTP input."""
-		peer_connection._set_raw_router(self, peer_id=peer_id, is_output=False)
+		peer_connection.setRawRtpRouter(self, peer_id=peer_id, is_output=False)
 
 		@peer_connection.on("connectionstatechange")
 		async def on_connectionstatechange() -> None:
@@ -507,7 +494,7 @@ class RawRtpRouter:
 		peer_id: PeerId,
 	) -> None:
 		"""Register a peer connection as a raw RTP output."""
-		peer_connection._set_raw_router(self, peer_id=peer_id, is_output=True)
+		peer_connection.setRawRtpRouter(self, peer_id=peer_id, is_output=True)
 
 		@peer_connection.on("connectionstatechange")
 		async def on_connectionstatechange() -> None:
@@ -522,7 +509,22 @@ class RawRtpRouter:
 		for kind in tuple(self._outputs_by_peer.get(peer_id, ())):
 			self.unregister_output(peer_id=peer_id, kind=kind)
 
-	def register_input(self, rtp_input: RtpInput) -> None:
+	def register_input(
+		self,
+		*,
+		peer_id: PeerId,
+		kind: MediaKind,
+		transport: RTCDtlsTransport,
+		local_rtcp_ssrc: int | None,
+		parameters: RTCRtpReceiveParameters,
+	) -> None:
+		rtp_input = RtpInput(
+			peer_id=peer_id,
+			kind=kind,
+			transport=transport,
+			local_rtcp_ssrc=local_rtcp_ssrc,
+			parameters=parameters,
+		)
 		if existing_track := self._tracks_by_kind.get(rtp_input.kind):
 			self.unregister_input(peer_id=existing_track.peer_id, kind=rtp_input.kind)
 		track = RawRtpTrack(rtp_input)
@@ -551,7 +553,18 @@ class RawRtpRouter:
 			track.close()
 			del self._tracks_by_kind[kind]
 
-	def register_output(self, output: RtpOutput) -> None:
+	def register_output(
+		self,
+		*,
+		peer_id: PeerId,
+		sender: RTCRtpSender,
+		parameters: RTCRtpSendParameters,
+	) -> None:
+		output = RtpOutput(
+			peer_id=peer_id,
+			sender=sender,
+			parameters=parameters,
+		)
 		self._outputs_by_peer.setdefault(output.peer_id, {})[output.kind] = output
 		if track := self._tracks_by_kind.get(output.kind):
 			track.subscribe(output)
@@ -578,7 +591,7 @@ class RawRtpRouter:
 			_LOGGER.debug("Dropping unparsable input RTCP from %s: %s", peer_id, err)
 			return
 
-		by_transport: dict[RawRtpDtlsTransport, list[AnyRtcpPacket]] = {}
+		by_transport: dict[RTCDtlsTransport, list[AnyRtcpPacket]] = {}
 		for packet in packets:
 			for track in tuple(self._tracks_by_kind.values()):
 				if track.peer_id != peer_id:
@@ -597,7 +610,7 @@ class RawRtpRouter:
 			_LOGGER.debug("Dropping unparsable output RTCP from %s: %s", peer_id, err)
 			return
 
-		by_transport: dict[RawRtpDtlsTransport, list[AnyRtcpPacket]] = {}
+		by_transport: dict[RTCDtlsTransport, list[AnyRtcpPacket]] = {}
 		for packet in packets:
 			for track in tuple(self._tracks_by_kind.values()):
 				for transport, rewritten in track.rewrite_rtcp_from_output(peer_id, packet):
@@ -606,290 +619,4 @@ class RawRtpRouter:
 		for transport, rewritten_packets in by_transport.items():
 			await transport._send_rtp(b"".join(bytes(packet) for packet in rewritten_packets))
 
-class RawRtpDtlsTransport(RTCDtlsTransport):
-	"""DTLS transport that routes decrypted media through a raw RTP router."""
-
-	def __init__(
-		self,
-		transport: RTCIceTransport,
-		certificates: list[RTCCertificate],
-		*,
-		router: RawRtpRouter,
-		peer_id: PeerId,
-		is_output: bool,
-	) -> None:
-		super().__init__(transport, certificates)
-		self.__router = router
-		self.__peer_id = peer_id
-		self.__is_output = is_output
-
-	@override
-	async def _handle_rtp_data(self, data: bytes, arrival_time_ms: int) -> None:
-		if not self.__is_output:
-			await self.__router.forward_input_rtp(self.__peer_id, data)
-
-	@override
-	async def _handle_rtcp_data(self, data: bytes) -> None:
-		if self.__is_output:
-			await self.__router.forward_output_rtcp(self.__peer_id, data)
-			return
-		await self.__router.forward_input_rtcp(self.__peer_id, data)
-
-
-class RawRtpSender(RTCRtpSender):
-	"""RTP sender that only registers negotiated outbound RTP state."""
-
-	def __init__(
-		self,
-		trackOrKind: MediaStreamTrack | MediaKind,
-		transport: RawRtpDtlsTransport,
-		*,
-		router: RawRtpRouter,
-		peer_id: PeerId,
-	) -> None:
-		super().__init__(trackOrKind, transport)
-		self.__router = router
-		self.__peer_id = peer_id
-		self.__started = False
-
-	@override
-	async def send(self, parameters: RTCRtpSendParameters) -> None:
-		if self.__started:
-			return
-		self.__router.register_output(RtpOutput(
-			peer_id=self.__peer_id,
-			sender=self,
-			parameters=parameters,
-		))
-		self.__started = True
-
-	@override
-	async def stop(self) -> None:
-		if self.__started:
-			self.__router.unregister_output(peer_id=self.__peer_id, kind=self.kind)
-			self.__started = False
-
-	@override
-	async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
-		return None
-
-
-class RawRtpReceiver(RTCRtpReceiver):
-	"""RTP receiver that only registers negotiated inbound RTP state."""
-
-	def __init__(
-		self,
-		kind: MediaKind,
-		transport: RawRtpDtlsTransport,
-		*,
-		router: RawRtpRouter,
-		peer_id: PeerId,
-	) -> None:
-		super().__init__(kind, transport)
-		self.__router = router
-		self.__peer_id = peer_id
-		self.__kind = kind
-		self.__started = False
-
-	@property
-	def local_rtcp_ssrc(self) -> int | None:
-		"""Return the local RTCP SSRC configured by aiortc."""
-		return cast(int | None, cast(Any, self)._RTCRtpReceiver__rtcp_ssrc)
-
-	@override
-	async def receive(self, parameters: RTCRtpReceiveParameters) -> None:
-		if self.__started:
-			return
-		transport = self.transport
-		if not isinstance(transport, RawRtpDtlsTransport):
-			raise RuntimeError(f"Raw RTP input for {self.__kind} has non-raw transport")
-		self.__router.register_input(RtpInput(
-			peer_id=self.__peer_id,
-			kind=self.__kind,
-			transport=transport,
-			local_rtcp_ssrc=self.local_rtcp_ssrc,
-			parameters=parameters,
-		))
-		self.__started = True
-
-	@override
-	async def stop(self) -> None:
-		if self.__started:
-			self.__router.unregister_input(peer_id=self.__peer_id, kind=self.__kind)
-			self.__started = False
-
-	@override
-	def _handle_disconnect(self) -> None:
-		return None
-
-	@override
-	async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
-		return None
-
-	@override
-	async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_ms: int) -> None:
-		return None
-
-
-class RawRtpPeerConnection(RTCPeerConnection):
-	"""Peer connection that negotiates normally and routes raw RTP."""
-
-	def __init__(
-		self,
-		*,
-		configuration: RTCConfiguration,
-	) -> None:
-		super().__init__(configuration=configuration)
-		self.__configuration = configuration
-		self.__router: RawRtpRouter | None = None
-		self.__peer_id: PeerId | None = None
-		self.__is_output: bool | None = None
-		self._pending_remote_candidates: list[RTCIceCandidate | None] = []
-
-	@property
-	def peer_id(self) -> PeerId:
-		"""Return this peer connection's raw RTP routing ID."""
-		if not (peer_id := self.__peer_id):
-			raise RuntimeError("Raw RTP peer has no ID")
-		return peer_id
-
-	@property
-	def rtc_configuration(self) -> RTCConfiguration:
-		"""Return the mutable RTC configuration used by this peer connection."""
-		return self.__configuration
-
-	def _set_raw_router(
-		self,
-		router: RawRtpRouter,
-		*,
-		peer_id: PeerId,
-		is_output: bool,
-	) -> None:
-		if self.__router:
-			raise RuntimeError("Raw RTP router is already attached")
-		pc = cast(Any, self)
-		if pc._RTCPeerConnection__transceivers or pc._RTCPeerConnection__sctp:
-			raise RuntimeError("Raw RTP router must be attached before transceivers are created")
-		self.__router = router
-		self.__peer_id = peer_id
-		self.__is_output = is_output
-
-	@override
-	async def addIceCandidate(self, candidate: RTCIceCandidate | None) -> None:
-		if not self.remoteDescription:
-			self._pending_remote_candidates.append(candidate)
-			return
-		await super().addIceCandidate(candidate)
-
-	async def add_pending_remote_candidates(self) -> None:
-		"""Apply ICE candidates received before the remote description."""
-		for candidate in self._pending_remote_candidates:
-			await super().addIceCandidate(candidate)
-		self._pending_remote_candidates = []
-
-	def __raw_router(self) -> RawRtpRouter:
-		if not (router := self.__router):
-			raise RuntimeError("Raw RTP router is not attached")
-		return router
-
-	def __raw_is_output(self) -> bool:
-		if self.__is_output is None:
-			raise RuntimeError("Raw RTP router is not attached")
-		return self.__is_output
-
-	def _RTCPeerConnection__createDtlsTransport(self) -> RawRtpDtlsTransport:
-		router = self.__raw_router()
-		pc = cast(Any, self)
-		if pc._RTCPeerConnection__transceivers or pc._RTCPeerConnection__sctp:
-			if pc._RTCPeerConnection__transceivers:
-				parameters = pc._RTCPeerConnection__transceivers[
-					0
-				].receiver.transport.transport.iceGatherer.getLocalParameters()
-			else:
-				parameters = (
-					pc._RTCPeerConnection__sctp.transport.transport.iceGatherer.getLocalParameters()
-				)
-			ice_gatherer = RTCIceGatherer(
-				iceServers=self.__configuration.iceServers,
-				local_username=parameters.usernameFragment,
-				local_password=parameters.password,
-			)
-		else:
-			ice_gatherer = RTCIceGatherer(iceServers=self.__configuration.iceServers)
-
-		ice_gatherer.on("statechange", pc._RTCPeerConnection__updateIceGatheringState)
-		ice_transport = RTCIceTransport(ice_gatherer)
-		ice_transport.on("statechange", pc._RTCPeerConnection__updateIceConnectionState)
-		ice_transport.on("statechange", pc._RTCPeerConnection__updateConnectionState)
-		pc._RTCPeerConnection__iceTransports.add(ice_transport)
-
-		dtls_transport = RawRtpDtlsTransport(
-			ice_transport,
-			pc._RTCPeerConnection__certificates,
-			router=router,
-			peer_id=self.peer_id,
-			is_output=self.__raw_is_output(),
-		)
-		dtls_transport.on("statechange", pc._RTCPeerConnection__updateConnectionState)
-		pc._RTCPeerConnection__dtlsTransports.add(dtls_transport)
-
-		pc._RTCPeerConnection__updateIceGatheringState()
-		pc._RTCPeerConnection__updateIceConnectionState()
-		pc._RTCPeerConnection__updateConnectionState()
-		return dtls_transport
-
-	def _RTCPeerConnection__createTransceiver(
-		self,
-		direction: str,
-		kind: MediaKind,
-		sender_track: MediaStreamTrack | None = None,
-	) -> RTCRtpTransceiver:
-		router = self.__raw_router()
-		pc = cast(Any, self)
-		dtls_transport = None
-		bundled = False
-		transceivers = pc._RTCPeerConnection__transceivers
-		if self.__configuration.bundlePolicy == RTCBundlePolicy.MAX_BUNDLE:
-			if transceivers:
-				dtls_transport = transceivers[0].receiver.transport
-				bundled = True
-			elif pc._RTCPeerConnection__sctp:
-				dtls_transport = pc._RTCPeerConnection__sctp.transport
-				bundled = True
-		elif self.__configuration.bundlePolicy == RTCBundlePolicy.BALANCED:
-			transceiver = next(
-				(item for item in transceivers if item.kind == kind),
-				None,
-			)
-			if transceiver:
-				dtls_transport = transceiver.receiver.transport
-				bundled = True
-
-		if not dtls_transport:
-			dtls_transport = pc._RTCPeerConnection__createDtlsTransport()
-		if not isinstance(dtls_transport, RawRtpDtlsTransport):
-			raise RuntimeError("Raw RTP transceiver received a non-raw DTLS transport")
-
-		sender = RawRtpSender(
-			sender_track or kind,
-			dtls_transport,
-			router=router,
-			peer_id=self.peer_id,
-		)
-		receiver = RawRtpReceiver(
-			kind,
-			dtls_transport,
-			router=router,
-			peer_id=self.peer_id,
-		)
-		transceiver = RTCRtpTransceiver(
-			direction="sendonly" if self.__raw_is_output() else "recvonly",
-			kind=kind,
-			sender=sender,
-			receiver=receiver,
-		)
-		transceiver.receiver._set_rtcp_ssrc(transceiver.sender._ssrc)
-		transceiver.sender._stream_id = pc._RTCPeerConnection__stream_id
-		transceiver._bundled = bundled
-		transceivers.append(transceiver)
-		return transceiver
+RawRtpPeerConnection = RTCPeerConnection

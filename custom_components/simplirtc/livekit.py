@@ -19,7 +19,7 @@ from aiohttp import (
 	ClientWebSocketResponse,
 	WSMsgType,
 )
-from aiortc import (
+from .vendor.aiortc import (
 	RTCIceServer,
 	RTCSessionDescription,
 )

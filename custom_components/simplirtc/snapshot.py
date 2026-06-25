@@ -7,13 +7,13 @@ from io import BytesIO
 from typing import Any, cast
 from uuid import uuid4
 
-from aiortc import (
+from .vendor.aiortc import (
 	RTCIceCandidate as AiortcIceCandidate,
 	RTCPeerConnection,
 	RTCSessionDescription,
 )
-from aiortc.mediastreams import MediaStreamTrack
-from aiortc.sdp import candidate_from_sdp
+from .vendor.aiortc.mediastreams import MediaStreamTrack
+from .vendor.aiortc.sdp import candidate_from_sdp
 from av.video.frame import VideoFrame
 from PIL.Image import Image
 

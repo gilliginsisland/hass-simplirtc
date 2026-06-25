@@ -8,12 +8,12 @@ import logging
 from typing import Any
 import uuid
 
-from aiortc import (
+from .vendor.aiortc import (
 	RTCConfiguration,
 	RTCIceCandidate,
 	RTCSessionDescription,
 )
-from aiortc.sdp import candidate_from_sdp
+from .vendor.aiortc.sdp import candidate_from_sdp
 
 from .rtp_router import (
 	RawRtpPeerConnection,
