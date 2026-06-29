@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import json
 import logging
 import time
 from typing import Any, TypeVar, override
@@ -24,22 +25,23 @@ from homeassistant.components.camera import (
 	CameraEntityDescription,
 	WebRTCAnswer,
 	WebRTCCandidate,
-	WebRTCMessage,
+	WebRTCClientConfiguration,
 	WebRTCSendMessage,
 )
 from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from webrtc_models import RTCIceCandidateInit
+from webrtc_models import RTCIceCandidateInit, RTCIceServer
 
-from .const import (
-	ATTR_CONFIG_ENTRY_ID,
-)
 from .kinesis import KinesisSession
-from .livekit import LiveKitProducer
-from .sfu import RawRtpSfu
-from .snapshot import DEFAULT_SNAPSHOT_TIMEOUT, Snapshotter
+from .livekit import LiveKitSession, fetch_ice_servers
+from .protobufs.livekit_rtc_pb2 import (
+	ICEServer,
+	SessionDescription,
+	SignalTarget,
+	TrickleRequest,
+)
 
 _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
@@ -133,42 +135,9 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 		width: int | None = None,
 		height: int | None = None,
 	) -> bytes | None:
-		"""Return a camera image from a temporary WebRTC session."""
+		"""Return a camera image."""
 		_ = width, height
-		snapshotter = Snapshotter()
-		try:
-			offer_sdp = await snapshotter.make_offer()
-
-			def send_message(message: WebRTCMessage) -> None:
-				match message:
-					case WebRTCAnswer(answer=answer):
-						snapshotter.send_answer(answer)
-					case WebRTCCandidate(candidate=RTCIceCandidateInit(
-						candidate=candidate,
-						sdp_mid=sdp_mid,
-						sdp_m_line_index=sdp_m_line_index,
-					)):
-						snapshotter.send_candidate(
-							candidate,
-							sdp_mid=sdp_mid,
-							sdp_m_line_index=sdp_m_line_index,
-						)
-					case _:
-						_LOGGER.debug("Dropping unsupported snapshot WebRTC message type=%s", type(message).__name__)
-
-			async with asyncio.timeout(DEFAULT_SNAPSHOT_TIMEOUT):
-				await self.async_handle_async_webrtc_offer(
-					offer_sdp,
-					snapshotter.session_id,
-					send_message,
-				)
-				return await snapshotter.wait_for_image()
-		except TimeoutError:
-			_LOGGER.debug("Timed out waiting for WebRTC camera image")
-			return None
-		finally:
-			self.close_webrtc_session(snapshotter.session_id)
-			await snapshotter.close()
+		return None
 
 
 class SimpliSafeLiveKitCamera(SimpliSafeCamera):
@@ -178,41 +147,172 @@ class SimpliSafeLiveKitCamera(SimpliSafeCamera):
 		super().__init__(simplisafe, system, device)
 		self._livekit_url: str = ""
 		self._livekit_token: str = ""
+		self._livekit_ice_servers: list[ICEServer] = []
+		self._livekit_client_configuration = WebRTCClientConfiguration()
 		self._cache_expiration: float = 0
 		self._lock = asyncio.Lock()
-		self._livekit_producer = LiveKitProducer(get_connection_info=self._live_view)
-		self._sfu = RawRtpSfu(
-			setup_producer_pc=self._livekit_producer.setup,
+		self._ice_server_task: asyncio.Task[None] | None = None
+		self._sessions: dict[str, LiveKitSession] = {}
+
+	@override
+	async def async_internal_added_to_hass(self) -> None:
+		"""Run when entity is added to hass."""
+		await super().async_internal_added_to_hass()
+		self._async_fetch_initial_livekit_ice_servers()
+
+	@override
+	async def async_will_remove_from_hass(self) -> None:
+		"""Run when entity will be removed from hass."""
+		if task := self._ice_server_task:
+			self._ice_server_task = None
+			task.cancel()
+		await super().async_will_remove_from_hass()
+
+	@override
+	@callback
+	def _async_get_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
+		"""Return cached LiveKit ICE servers for the browser peer connection."""
+		return self._livekit_client_configuration
+
+	@callback
+	def _async_fetch_initial_livekit_ice_servers(self) -> None:
+		"""Start the initial LiveKit ICE server fetch if one is not already running."""
+		if self._ice_server_task and not self._ice_server_task.done():
+			return
+		self._ice_server_task = self.hass.async_create_task(
+			self._fetch_initial_livekit_ice_servers(),
+			f"simplirtc-fetch-livekit-ice-{self.entity_id}",
 		)
+
+	async def _fetch_initial_livekit_ice_servers(self) -> None:
+		"""Fetch initial LiveKit ICE servers for the sync client config hook."""
+		try:
+			livekit_url, user_token = await self._live_view()
+			self._async_update_livekit_ice_servers(
+				await fetch_ice_servers(livekit_url, user_token)
+			)
+		except Exception as err:
+			_LOGGER.debug("Failed to refresh LiveKit ICE servers for %s: %s", self.entity_id, err)
+		finally:
+			if self._ice_server_task is asyncio.current_task():
+				self._ice_server_task = None
+
+	@callback
+	def _async_update_livekit_ice_servers(
+		self,
+		ice_servers: list[ICEServer],
+	) -> None:
+		"""Store LiveKit ICE servers when the server reports a new list."""
+		if self._livekit_ice_servers == ice_servers:
+			return
+		_LOGGER.debug(
+			"Updating LiveKit ICE servers for %s: count=%s",
+			self.entity_id,
+			len(ice_servers),
+		)
+		self._livekit_ice_servers = ice_servers
+		config = WebRTCClientConfiguration()
+		for ice_server in ice_servers:
+			config.configuration.ice_servers.append(RTCIceServer(
+				urls=list(ice_server.urls),
+				username=ice_server.username or None,
+				credential=ice_server.credential or None,
+			))
+		self._livekit_client_configuration = config
 
 	@override
 	async def async_handle_async_webrtc_offer(
 		self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
 	) -> None:
-		"""Handle a WebRTC offer with an immediately available SFU session."""
-		answer_sdp = await self._sfu.create_session(
-			offer_sdp,
-			peer_id=session_id,
+		"""Handle a browser WebRTC offer through LiveKit signaling."""
+		livekit_url, user_token = await self._live_view()
+
+		def send_answer(answer: SessionDescription) -> None:
+			send_message(WebRTCAnswer(answer=answer.sdp))
+
+		def send_candidate(trickle: TrickleRequest) -> None:
+			if trickle.final and not trickle.candidateInit:
+				send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
+					candidate="",
+					sdp_mid=None,
+					sdp_m_line_index=None,
+				)))
+				return
+			if not trickle.candidateInit:
+				return
+
+			try:
+				candidate_init = json.loads(trickle.candidateInit)
+			except ValueError as err:
+				_LOGGER.warning("Dropping invalid LiveKit ICE candidate JSON: %s", err)
+				return
+
+			candidate = candidate_init.get("candidate")
+			if not isinstance(candidate, str):
+				_LOGGER.warning("Dropping LiveKit ICE candidate without candidate field")
+				return
+			sdp_mid = candidate_init.get("sdpMid")
+			sdp_m_line_index = candidate_init.get("sdpMLineIndex")
+			send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
+				candidate=candidate,
+				sdp_mid=sdp_mid if isinstance(sdp_mid, str) else None,
+				sdp_m_line_index=(
+					sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
+				),
+			)))
+
+		def on_close() -> None:
+			if self._sessions.get(session_id) is session:
+				self._sessions.pop(session_id, None)
+
+		session = LiveKitSession(
+			session_id=session_id,
+			livekit_url=livekit_url,
+			user_token=user_token,
+			offer_sdp=offer_sdp,
+			send_answer=send_answer,
+			send_candidate=send_candidate,
+			on_close=on_close,
+			on_ice_servers=self._async_update_livekit_ice_servers,
 		)
-		send_message(WebRTCAnswer(answer=answer_sdp))
+		self._sessions[session_id] = session
+		try:
+			await session.start()
+		except BaseException:
+			on_close()
+			raise
 
 	@override
 	async def async_on_webrtc_candidate(
 		self, session_id: str, candidate: RTCIceCandidateInit
 	) -> None:
-		"""Handle a WebRTC candidate for an SFU consumer."""
-		await self._sfu.add_candidate(
-			session_id,
-			candidate.candidate,
-			sdp_mid=candidate.sdp_mid,
-			sdp_m_line_index=candidate.sdp_m_line_index,
-		)
+		"""Handle a browser WebRTC candidate for LiveKit."""
+		if not (session := self._sessions.get(session_id)):
+			_LOGGER.debug("Ignoring WebRTC candidate for closed session %s", session_id)
+			return
+
+		# LiveKit rejects the browser's final null ICE event if it is serialized
+		# as an empty candidateInit, and the session works without forwarding it.
+		if not candidate.candidate:
+			return
+
+		candidate_init: dict[str, str | int] = {"candidate": candidate.candidate}
+		if candidate.sdp_mid is not None:
+			candidate_init["sdpMid"] = candidate.sdp_mid
+		if candidate.sdp_m_line_index is not None:
+			candidate_init["sdpMLineIndex"] = candidate.sdp_m_line_index
+
+		await session.send_candidate(TrickleRequest(
+			candidateInit=json.dumps(candidate_init, separators=(",", ":")),
+			target=SignalTarget.PUBLISHER,
+		))
 
 	@override
 	@callback
 	def close_webrtc_session(self, session_id: str) -> None:
-		"""Close an SFU consumer WebRTC session."""
-		self._sfu.close_session(session_id)
+		"""Close a LiveKit signaling session."""
+		if session := self._sessions.pop(session_id, None):
+			session.close()
 
 	async def _live_view(self) -> tuple[str, str]:
 		if time.time() < self._cache_expiration:
