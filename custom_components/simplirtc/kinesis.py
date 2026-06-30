@@ -131,7 +131,8 @@ class KinesisSession:
 					self._logger.debug("-> %s", candidate_msg)
 					await ws.send_json(asdict(candidate_msg))
 
-			async def receive_kinesis_messages() -> None:
+			async with asyncio.TaskGroup() as task_group:
+				task_group.create_task(send_kinesis_candidates())
 				async for msg in ws:
 					self._logger.debug("<- %s", msg.data)
 
@@ -156,9 +157,3 @@ class KinesisSession:
 							)
 						case _:
 							continue
-
-				self.close()
-
-			async with asyncio.TaskGroup() as task_group:
-				task_group.create_task(send_kinesis_candidates())
-				task_group.create_task(receive_kinesis_messages())
