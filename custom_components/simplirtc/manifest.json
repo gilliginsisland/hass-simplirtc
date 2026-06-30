@@ -5,7 +5,13 @@
     "simplisafe"
   ],
   "requirements": [
-    "aiortc==1.14.0"
+    "aioice>=0.10.1,<1.0.0",
+    "av>=14.0.0,<18.0.0",
+    "cryptography>=44.0.0",
+    "google-crc32c>=1.1",
+    "pyee>=13.0.0",
+    "pylibsrtp>=0.10.0",
+    "pyopenssl>=25.0.0"
   ],
   "codeowners": [
     "gilliginsisland"
