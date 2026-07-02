@@ -31,7 +31,7 @@ from .const import (
 	DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
 )
-from .web import SimpliRTCStreamInfoView
+from .web import SimpliRTCFlvProxyView, SimpliRTCStreamInfoView
 
 PLATFORMS = [
 	Platform.CAMERA,
@@ -48,6 +48,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 		return True
 
 	hass.http.register_view(SimpliRTCStreamInfoView(hass))
+	hass.http.register_view(SimpliRTCFlvProxyView(hass))
 
 	@callback
 	def async_config_entry_changed(change: ConfigEntryChange, entry: ConfigEntry) -> None:

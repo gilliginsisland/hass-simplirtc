@@ -6,12 +6,14 @@ import asyncio
 from collections.abc import Mapping
 import json
 import logging
+import secrets
 import time
 from typing import Any, TypeVar, override
 
+import aiohttp
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
-from simplipy.device.camera import Camera
+from simplipy.device.camera import Camera, CameraTypes
 from simplipy.system.v3 import SystemV3
 from simplipy.websocket import (
 	EVENT_CAMERA_MOTION_DETECTED,
@@ -31,6 +33,7 @@ from homeassistant.components.camera import (
 from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from webrtc_models import RTCIceCandidateInit, RTCIceServer
 
@@ -68,14 +71,24 @@ async def async_setup_entry(
 				_LOGGER.warning("Skipping camera '%s'. Unexpected settings schema.", camera.name)
 				continue
 
+			cls: type[SimpliSafeCamera]
 			match settings.get("webRTCProvider"):
 				case "mist":
 					cls = SimpliSafeLiveKitCamera
 				case "kvs":
 					cls = SimpliSafeKenisisCamera
 				case _ as provider:
-					_LOGGER.warning("Camera '%s' has unknown webrtc provider '%s'", camera.name, provider)
-					continue
+					# Cameras without a supported WebRTC backend (e.g. the video
+					# doorbell, SS002) stream over the legacy FLV media endpoint,
+					# served out-of-process through go2rtc.
+					if camera.camera_type in (CameraTypes.CAMERA, CameraTypes.DOORBELL):
+						cls = SimpliSafeGo2rtcCamera
+					else:
+						_LOGGER.warning(
+							"Camera '%s' has unsupported backend (provider=%s, type=%s)",
+							camera.name, provider, camera.camera_type,
+						)
+						continue
 
 			cameras.append(cls(simplisafe, system, camera))
 
@@ -138,6 +151,96 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 		"""Return a camera image."""
 		_ = width, height
 		return None
+
+
+class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
+	"""A SimpliSafe camera that streams the legacy FLV media endpoint via go2rtc.
+
+	Cameras without a supported WebRTC backend (for example the video doorbell)
+	stream over SimpliSafe's FLV media endpoint. Home Assistant's built-in
+	stream worker decodes media in-process and libav crashes hard on this FLV,
+	so the live view is served through the bundled go2rtc instead:
+	``stream_source`` returns an ``ffmpeg:`` source pointing at a local proxy
+	view, which go2rtc reads out-of-process. HA's in-process libav can never
+	open the ``ffmpeg:`` scheme, so it never demuxes the FLV and cannot crash on
+	it. Snapshots use the MJPEG endpoint over plain HTTP.
+	"""
+
+	def __init__(
+		self,
+		simplisafe: SimpliSafe,
+		system: SystemV3,
+		device: Camera,
+	) -> None:
+		"""Initialize the go2rtc-backed SimpliSafe camera."""
+		super().__init__(simplisafe, system, device)
+		# Shared secret so only go2rtc (which is handed the generated
+		# stream_source) can pull the authenticated FLV through the proxy view.
+		self._proxy_token = secrets.token_urlsafe(24)
+
+	@property
+	def proxy_token(self) -> str:
+		"""Return the secret guarding this camera's FLV proxy URL."""
+		return self._proxy_token
+
+	@property
+	def access_token(self) -> str | None:
+		"""Return the current SimpliSafe bearer token, if available."""
+		return self._simplisafe._api.access_token  # pyright: ignore[reportPrivateUsage]
+
+	def flv_url(self, width: int = 1280) -> str:
+		"""Return the authenticated SimpliSafe FLV media URL."""
+		return self._device.video_url(width=width)
+
+	@override
+	async def stream_source(self) -> str | None:
+		"""Return a go2rtc ffmpeg source pointing at the local FLV proxy.
+
+		The ``ffmpeg:`` scheme routes this to go2rtc (out-of-process). HA's
+		in-process stream worker cannot open the ``ffmpeg:`` scheme, so it can
+		never demux the FLV and cannot segfault on it.
+		"""
+		if not self.access_token:
+			return None
+		port = self.hass.http.server_port
+		proxy_url = (
+			f"http://127.0.0.1:{port}/api/simplirtc_flv/{self.entity_id}"
+			f"?sig={self._proxy_token}"
+		)
+		return f"ffmpeg:{proxy_url}#video=copy#audio=opus"
+
+	@override
+	async def async_camera_image(
+		self,
+		width: int | None = None,
+		height: int | None = None,
+	) -> bytes | None:
+		"""Return a still image from the MJPEG media endpoint over plain HTTP."""
+		_ = height
+		if not (token := self.access_token):
+			return None
+
+		snapshot_width = width or 1280
+		# Derive the media base from video_url() so we reuse whichever device
+		# identifier SimpliSafe expects in the media path.
+		media_base = self.flv_url(width=snapshot_width).split("/flv?", 1)[0]
+		url = f"{media_base}/mjpg?x={snapshot_width}&fr=1"
+
+		session = async_get_clientsession(self.hass)
+		try:
+			async with session.get(
+				url, headers={"Authorization": f"Bearer {token}"}
+			) as response:
+				if response.status != 200:
+					_LOGGER.debug(
+						"Snapshot request for %s returned HTTP %s",
+						self.entity_id, response.status,
+					)
+					return None
+				return await response.read()
+		except (aiohttp.ClientError, TimeoutError) as err:
+			_LOGGER.debug("Snapshot request for %s failed: %s", self.entity_id, err)
+			return None
 
 
 class SimpliSafeLiveKitCamera(SimpliSafeCamera):
