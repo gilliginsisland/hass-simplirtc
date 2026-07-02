@@ -48,6 +48,10 @@ from .protobufs.livekit_rtc_pb2 import (
 
 _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
+WAKEUP_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v1"
+WAKE_DEBOUNCE_SECONDS = 10.0
+# How long to let a freshly-woken camera start publishing before go2rtc connects.
+WAKE_SETTLE_SECONDS = 2.0
 _StreamResponseT = TypeVar("_StreamResponseT")
 
 
@@ -135,6 +139,29 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 		self._attr_unique_id = f"{super().unique_id}-camera"
 		self._attr_supported_features |= CameraEntityFeature.STREAM
 		self._device: Camera
+		self._last_wake_monotonic: float = 0.0
+
+	async def _async_wake_cameras(self) -> bool:
+		"""Nudge idle cameras to (re)join the streaming room before a stream starts.
+
+		A camera can report "online" yet not be publishing to the room; this
+		POST signals it to join. Failures are non-fatal. Debounced so rapid
+		stream starts don't spam the endpoint. Returns True if a wake was
+		actually issued (the caller may then allow the camera a moment to start
+		publishing), or False if the call was debounced.
+		"""
+		now = time.monotonic()
+		if now - self._last_wake_monotonic < WAKE_DEBOUNCE_SECONDS:
+			return False
+		self._last_wake_monotonic = now
+		path = f"ss3/subscriptions/{self._system.system_id}/camera-wakeup"
+		try:
+			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
+				"post", path, url_base=WAKEUP_URL_BASE, json={"wakeAll": True}
+			)
+		except Exception as err:
+			_LOGGER.debug("Failed to wake cameras for %s: %s", self.entity_id, err)
+		return True
 
 	async def _create_stream(self, response_type: type[_StreamResponseT]) -> _StreamResponseT:
 		path = f"cameras/{self._device.serial}/{self._system.system_id}/live-view"
@@ -202,6 +229,10 @@ class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
 		"""
 		if not self.access_token:
 			return None
+		# Wake idle cameras (e.g. the doorbell) so frames are already flowing by
+		# the time go2rtc connects; give a fresh wake a moment to take effect.
+		if await self._async_wake_cameras():
+			await asyncio.sleep(WAKE_SETTLE_SECONDS)
 		port = self.hass.http.server_port
 		proxy_url = (
 			f"http://127.0.0.1:{port}/api/simplirtc_flv/{self.entity_id}"
