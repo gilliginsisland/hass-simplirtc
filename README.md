@@ -28,13 +28,21 @@ camera's WebRTC backend. SimpliSafe does not appear to expose a camera
 motion-active API state or a matching motion-clear event, so motion is exposed
 as an event rather than a latched on/off state.
 
+For the SimpliSafe Video Doorbell Pro, SimpliRTC adds a doorbell event entity
+(device class `doorbell`) that fires a `ring` event on a button press, also
+backed by SimpliSafe websocket events.
+
 ## Supported Systems
 
 Only SimpliSafe V3 systems are supported. Older system versions are skipped.
 
 SimpliSafe uses different video backends for different accounts and systems.
 Some cameras use AWS Kinesis Video Streams, and some use LiveKit. SimpliRTC
-supports both of those backends.
+supports both of those WebRTC backends. Cameras that do not report a WebRTC
+backend (such as the Video Doorbell Pro and the original SimpliCam) stream over
+SimpliSafe's legacy FLV media endpoint; SimpliRTC serves these through Home
+Assistant's bundled go2rtc so the fragile FLV is decoded out-of-process and
+cannot take down Home Assistant.
 
 Some reported systems use a different backend that SimpliRTC does not currently
 support. Cameras on unknown backends are intentionally ignored instead of being
@@ -57,4 +65,7 @@ SimpliRTC currently recognizes these values:
 - `kvs`: AWS Kinesis Video Streams
 - `mist`: LiveKit
 
-Any other `webRTCProvider` value is treated as unknown and skipped.
+Cameras that report any other (or no) `webRTCProvider` value fall back to the
+legacy FLV media stream (served via go2rtc) when the camera is a SimpliCam or a
+doorbell. Other camera types (for example the outdoor camera) are still treated
+as unknown and skipped.

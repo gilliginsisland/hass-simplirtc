@@ -6,12 +6,14 @@ import asyncio
 from collections.abc import Mapping
 import json
 import logging
+import secrets
 import time
 from typing import Any, TypeVar, override
 
+import aiohttp
 from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
-from simplipy.device.camera import Camera
+from simplipy.device.camera import Camera, CameraTypes
 from simplipy.system.v3 import SystemV3
 from simplipy.websocket import (
 	EVENT_CAMERA_MOTION_DETECTED,
@@ -31,6 +33,7 @@ from homeassistant.components.camera import (
 from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from webrtc_models import RTCIceCandidateInit, RTCIceServer
 
@@ -45,6 +48,12 @@ from .protobufs.livekit_rtc_pb2 import (
 
 _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
+WAKEUP_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v1"
+WAKE_DEBOUNCE_SECONDS = 10.0
+# How long to let a freshly-woken camera start publishing before consumers connect.
+WAKE_SETTLE_SECONDS = 5.0
+# go2rtc's managed RTSP listener (see the go2rtc integration's server config).
+GO2RTC_RTSP_PORT = 18554
 _StreamResponseT = TypeVar("_StreamResponseT")
 
 
@@ -68,14 +77,24 @@ async def async_setup_entry(
 				_LOGGER.warning("Skipping camera '%s'. Unexpected settings schema.", camera.name)
 				continue
 
+			cls: type[SimpliSafeCamera]
 			match settings.get("webRTCProvider"):
 				case "mist":
 					cls = SimpliSafeLiveKitCamera
 				case "kvs":
 					cls = SimpliSafeKenisisCamera
 				case _ as provider:
-					_LOGGER.warning("Camera '%s' has unknown webrtc provider '%s'", camera.name, provider)
-					continue
+					# Cameras without a supported WebRTC backend (e.g. the video
+					# doorbell, SS002) stream over the legacy FLV media endpoint,
+					# served out-of-process through go2rtc.
+					if camera.camera_type in (CameraTypes.CAMERA, CameraTypes.DOORBELL):
+						cls = SimpliSafeGo2rtcCamera
+					else:
+						_LOGGER.warning(
+							"Camera '%s' has unsupported backend (provider=%s, type=%s)",
+							camera.name, provider, camera.camera_type,
+						)
+						continue
 
 			cameras.append(cls(simplisafe, system, camera))
 
@@ -122,6 +141,29 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 		self._attr_unique_id = f"{super().unique_id}-camera"
 		self._attr_supported_features |= CameraEntityFeature.STREAM
 		self._device: Camera
+		self._last_wake_monotonic: float = 0.0
+
+	async def _async_wake_cameras(self) -> bool:
+		"""Nudge idle cameras to (re)join the streaming room before a stream starts.
+
+		A camera can report "online" yet not be publishing to the room; this
+		POST signals it to join. Failures are non-fatal. Debounced so rapid
+		stream starts don't spam the endpoint. Returns True if a wake was
+		actually issued (the caller may then allow the camera a moment to start
+		publishing), or False if the call was debounced.
+		"""
+		now = time.monotonic()
+		if now - self._last_wake_monotonic < WAKE_DEBOUNCE_SECONDS:
+			return False
+		self._last_wake_monotonic = now
+		path = f"ss3/subscriptions/{self._system.system_id}/camera-wakeup"
+		try:
+			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
+				"post", path, url_base=WAKEUP_URL_BASE, json={"wakeAll": True}
+			)
+		except Exception as err:
+			_LOGGER.debug("Failed to wake cameras for %s: %s", self.entity_id, err)
+		return True
 
 	async def _create_stream(self, response_type: type[_StreamResponseT]) -> _StreamResponseT:
 		path = f"cameras/{self._device.serial}/{self._system.system_id}/live-view"
@@ -138,6 +180,130 @@ class SimpliSafeCamera(SimpliSafeEntity, CameraEntity):
 		"""Return a camera image."""
 		_ = width, height
 		return None
+
+
+class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
+	"""A SimpliSafe camera that streams the legacy FLV media endpoint via go2rtc.
+
+	Cameras without a supported WebRTC backend (for example the video doorbell)
+	stream over SimpliSafe's FLV media endpoint, whose quirks (bearer-header
+	auth, wildly non-monotonic timestamps, AVCC H264) break Home Assistant's
+	in-process stream worker. Instead, a local proxy view (see ``web.py``)
+	re-muxes the authenticated FLV out-of-process with ffmpeg, and this camera
+	publishes that through the bundled go2rtc as plain RTSP so HomeKit, HLS and
+	WebRTC can all consume it. Snapshots use the MJPEG endpoint over plain HTTP.
+	"""
+
+	def __init__(
+		self,
+		simplisafe: SimpliSafe,
+		system: SystemV3,
+		device: Camera,
+	) -> None:
+		"""Initialize the go2rtc-backed SimpliSafe camera."""
+		super().__init__(simplisafe, system, device)
+		# Shared secret so only go2rtc (which is handed the generated
+		# stream_source) can pull the authenticated FLV through the proxy view.
+		self._proxy_token = secrets.token_urlsafe(24)
+
+	@property
+	def proxy_token(self) -> str:
+		"""Return the secret guarding this camera's FLV proxy URL."""
+		return self._proxy_token
+
+	@property
+	def access_token(self) -> str | None:
+		"""Return the current SimpliSafe bearer token, if available."""
+		return self._simplisafe._api.access_token  # pyright: ignore[reportPrivateUsage]
+
+	def flv_url(self, width: int = 1280) -> str:
+		"""Return the authenticated SimpliSafe FLV media URL."""
+		return self._device.video_url(width=width)
+
+	@override
+	async def stream_source(self) -> str | None:
+		"""Return the go2rtc RTSP URL that republishes the doorbell's FLV."""
+		if not self.access_token:
+			return None
+		# Pre-warm: wake the camera and let it start publishing *before* any
+		# consumer connects, so the go2rtc RTSP stream is ready when HomeKit / HLS
+		# probe it (RTSP consumers, unlike WebRTC, don't tolerate a cold start).
+		if await self._async_wake_cameras():
+			await asyncio.sleep(WAKE_SETTLE_SECONDS)
+		port = self.hass.http.server_port
+		proxy_url = (
+			f"http://127.0.0.1:{port}/api/simplirtc_flv/{self.entity_id}"
+			f"?sig={self._proxy_token}"
+		)
+		# Publish the FLV through go2rtc as plain RTSP so HomeKit, HLS and WebRTC
+		# all consume it with no per-camera config. HA's managed go2rtc only
+		# accepts simple "ffmpeg:" sources through its API (it rejects "exec:" and
+		# custom input args), so the FLV's non-monotonic timestamps — which
+		# freeze HomeKit's ffmpeg — are fixed upstream in the proxy view, which
+		# re-muxes with a wallclock. go2rtc then decodes the already-clean FLV
+		# out-of-process into RTSP.
+		go2rtc_source = f"ffmpeg:{proxy_url}#video=copy#audio=opus"
+		# Return the go2rtc RTSP URL, or None if go2rtc can't be reached. Never a
+		# raw go2rtc source string: ffmpeg-based consumers (HomeKit) choke on it.
+		return await self._async_ensure_go2rtc_rtsp(go2rtc_source)
+
+	async def _async_ensure_go2rtc_rtsp(self, source: str) -> str | None:
+		"""Publish the FLV source through go2rtc and return its RTSP URL.
+
+		Registers a go2rtc stream fed by the out-of-process ``ffmpeg:`` source
+		and returns its managed RTSP address, or None if the bundled go2rtc
+		client cannot be reached.
+		"""
+		try:
+			from homeassistant.components.go2rtc.const import DOMAIN as GO2RTC_DOMAIN
+
+			entries = self.hass.config_entries.async_entries(GO2RTC_DOMAIN)
+			if not entries:
+				_LOGGER.error("SimpliRTC go2rtc RTSP: no go2rtc config entry found")
+				return None
+			client = entries[0].runtime_data._rest_client  # pyright: ignore[reportAttributeAccessIssue]
+			name = f"simplirtc_{self._device.serial}"
+			await client.streams.add(name, [source])
+			return f"rtsp://127.0.0.1:{GO2RTC_RTSP_PORT}/{name}"
+		except Exception as err:
+			_LOGGER.error(
+				"SimpliRTC go2rtc RTSP publish failed for %s: %r (source=%s)",
+				self.entity_id, err, source,
+			)
+			return None
+
+	@override
+	async def async_camera_image(
+		self,
+		width: int | None = None,
+		height: int | None = None,
+	) -> bytes | None:
+		"""Return a still image from the MJPEG media endpoint over plain HTTP."""
+		_ = height
+		if not (token := self.access_token):
+			return None
+
+		snapshot_width = width or 1280
+		# Derive the media base from video_url() so we reuse whichever device
+		# identifier SimpliSafe expects in the media path.
+		media_base = self.flv_url(width=snapshot_width).split("/flv?", 1)[0]
+		url = f"{media_base}/mjpg?x={snapshot_width}&fr=1"
+
+		session = async_get_clientsession(self.hass)
+		try:
+			async with session.get(
+				url, headers={"Authorization": f"Bearer {token}"}
+			) as response:
+				if response.status != 200:
+					_LOGGER.debug(
+						"Snapshot request for %s returned HTTP %s",
+						self.entity_id, response.status,
+					)
+					return None
+				return await response.read()
+		except (aiohttp.ClientError, TimeoutError) as err:
+			_LOGGER.debug("Snapshot request for %s failed: %s", self.entity_id, err)
+			return None
 
 
 class SimpliSafeLiveKitCamera(SimpliSafeCamera):

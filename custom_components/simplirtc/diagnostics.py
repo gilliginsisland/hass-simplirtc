@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from simplipy.device.camera import Camera
+from simplipy.device.camera import Camera, CameraTypes
 from simplipy.system.v3 import SystemV3
 
 from homeassistant.components.diagnostics import async_redact_data
@@ -58,11 +58,12 @@ def _describe_system(system: object, index: int) -> dict[str, Any]:
 
 
 def _describe_camera(camera: Camera) -> dict[str, Any]:
-	raw_provider, backend, supported, skip_reason = _describe_webrtc_provider(
-		camera.camera_settings.get("admin")
+	raw_provider, backend, supported, skip_reason = _describe_backend(
+		camera.camera_settings.get("admin"), camera.camera_type
 	)
 	return {
 		"name": camera.name,
+		"camera_type": str(camera.camera_type),
 		"webRTCProvider": raw_provider,
 		"backend": backend,
 		"supported": supported,
@@ -70,21 +71,27 @@ def _describe_camera(camera: Camera) -> dict[str, Any]:
 	}
 
 
-def _describe_webrtc_provider(
+def _describe_backend(
 	settings: object,
+	camera_type: CameraTypes,
 ) -> tuple[str | None, str, bool, str | None]:
 	if not isinstance(settings, Mapping):
 		return None, "unknown", False, "unexpected_settings_schema"
 
 	provider = settings.get("webRTCProvider")
-	raw_provider = str(provider)
+	raw_provider = None if provider is None else str(provider)
 
 	match provider:
 		case "mist":
 			return raw_provider, "livekit", True, None
 		case "kvs":
 			return raw_provider, "kinesis", True, None
-		case None:
-			return None, "unknown", False, "missing_webrtc_provider"
 		case _:
-			return raw_provider, "unknown", False, "unknown_webrtc_provider"
+			# No supported WebRTC backend; SimpliCam and doorbell cameras fall
+			# back to the legacy FLV media stream, served via go2rtc.
+			if camera_type in (CameraTypes.CAMERA, CameraTypes.DOORBELL):
+				return raw_provider, "flv", True, None
+			reason = (
+				"missing_webrtc_provider" if provider is None else "unknown_webrtc_provider"
+			)
+			return raw_provider, "unknown", False, reason
