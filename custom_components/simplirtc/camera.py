@@ -50,8 +50,10 @@ _LOGGER = logging.getLogger(__name__)
 WEBRTC_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v2"
 WAKEUP_URL_BASE = "https://app-hub.prd.aser.simplisafe.com/v1"
 WAKE_DEBOUNCE_SECONDS = 10.0
-# How long to let a freshly-woken camera start publishing before go2rtc connects.
-WAKE_SETTLE_SECONDS = 2.0
+# How long to let a freshly-woken camera start publishing before consumers connect.
+WAKE_SETTLE_SECONDS = 5.0
+# go2rtc's managed RTSP listener (see the go2rtc integration's server config).
+GO2RTC_RTSP_PORT = 18554
 _StreamResponseT = TypeVar("_StreamResponseT")
 
 
@@ -184,13 +186,12 @@ class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
 	"""A SimpliSafe camera that streams the legacy FLV media endpoint via go2rtc.
 
 	Cameras without a supported WebRTC backend (for example the video doorbell)
-	stream over SimpliSafe's FLV media endpoint. Home Assistant's built-in
-	stream worker decodes media in-process and libav crashes hard on this FLV,
-	so the live view is served through the bundled go2rtc instead:
-	``stream_source`` returns an ``ffmpeg:`` source pointing at a local proxy
-	view, which go2rtc reads out-of-process. HA's in-process libav can never
-	open the ``ffmpeg:`` scheme, so it never demuxes the FLV and cannot crash on
-	it. Snapshots use the MJPEG endpoint over plain HTTP.
+	stream over SimpliSafe's FLV media endpoint, whose quirks (bearer-header
+	auth, wildly non-monotonic timestamps, AVCC H264) break Home Assistant's
+	in-process stream worker. Instead, a local proxy view (see ``web.py``)
+	re-muxes the authenticated FLV out-of-process with ffmpeg, and this camera
+	publishes that through the bundled go2rtc as plain RTSP so HomeKit, HLS and
+	WebRTC can all consume it. Snapshots use the MJPEG endpoint over plain HTTP.
 	"""
 
 	def __init__(
@@ -221,16 +222,12 @@ class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
 
 	@override
 	async def stream_source(self) -> str | None:
-		"""Return a go2rtc ffmpeg source pointing at the local FLV proxy.
-
-		The ``ffmpeg:`` scheme routes this to go2rtc (out-of-process). HA's
-		in-process stream worker cannot open the ``ffmpeg:`` scheme, so it can
-		never demux the FLV and cannot segfault on it.
-		"""
+		"""Return the go2rtc RTSP URL that republishes the doorbell's FLV."""
 		if not self.access_token:
 			return None
-		# Wake idle cameras (e.g. the doorbell) so frames are already flowing by
-		# the time go2rtc connects; give a fresh wake a moment to take effect.
+		# Pre-warm: wake the camera and let it start publishing *before* any
+		# consumer connects, so the go2rtc RTSP stream is ready when HomeKit / HLS
+		# probe it (RTSP consumers, unlike WebRTC, don't tolerate a cold start).
 		if await self._async_wake_cameras():
 			await asyncio.sleep(WAKE_SETTLE_SECONDS)
 		port = self.hass.http.server_port
@@ -238,7 +235,42 @@ class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
 			f"http://127.0.0.1:{port}/api/simplirtc_flv/{self.entity_id}"
 			f"?sig={self._proxy_token}"
 		)
-		return f"ffmpeg:{proxy_url}#video=copy#audio=opus"
+		# Publish the FLV through go2rtc as plain RTSP so HomeKit, HLS and WebRTC
+		# all consume it with no per-camera config. HA's managed go2rtc only
+		# accepts simple "ffmpeg:" sources through its API (it rejects "exec:" and
+		# custom input args), so the FLV's non-monotonic timestamps — which
+		# freeze HomeKit's ffmpeg — are fixed upstream in the proxy view, which
+		# re-muxes with a wallclock. go2rtc then decodes the already-clean FLV
+		# out-of-process into RTSP.
+		go2rtc_source = f"ffmpeg:{proxy_url}#video=copy#audio=opus"
+		# Return the go2rtc RTSP URL, or None if go2rtc can't be reached. Never a
+		# raw go2rtc source string: ffmpeg-based consumers (HomeKit) choke on it.
+		return await self._async_ensure_go2rtc_rtsp(go2rtc_source)
+
+	async def _async_ensure_go2rtc_rtsp(self, source: str) -> str | None:
+		"""Publish the FLV source through go2rtc and return its RTSP URL.
+
+		Registers a go2rtc stream fed by the out-of-process ``ffmpeg:`` source
+		and returns its managed RTSP address, or None if the bundled go2rtc
+		client cannot be reached.
+		"""
+		try:
+			from homeassistant.components.go2rtc.const import DOMAIN as GO2RTC_DOMAIN
+
+			entries = self.hass.config_entries.async_entries(GO2RTC_DOMAIN)
+			if not entries:
+				_LOGGER.error("SimpliRTC go2rtc RTSP: no go2rtc config entry found")
+				return None
+			client = entries[0].runtime_data._rest_client  # pyright: ignore[reportAttributeAccessIssue]
+			name = f"simplirtc_{self._device.serial}"
+			await client.streams.add(name, [source])
+			return f"rtsp://127.0.0.1:{GO2RTC_RTSP_PORT}/{name}"
+		except Exception as err:
+			_LOGGER.error(
+				"SimpliRTC go2rtc RTSP publish failed for %s: %r (source=%s)",
+				self.entity_id, err, source,
+			)
+			return None
 
 	@override
 	async def async_camera_image(
