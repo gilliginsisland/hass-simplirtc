@@ -8,7 +8,7 @@ import functools
 import logging
 from typing import TypeVar, override
 
-from pydantic import TypeAdapter
+from pydantic import Field, TypeAdapter
 from pydantic.dataclasses import dataclass
 from simplipy.device.camera import Camera
 from simplipy.system.v3 import SystemV3
@@ -94,6 +94,29 @@ class LiveKitDetails:
 	userToken: str
 
 
+@dataclass(kw_only=True, slots=True)
+class EventMediaLink:
+	href: str
+
+
+@dataclass(kw_only=True, slots=True)
+class EventVideo:
+	links: dict[str, EventMediaLink] = Field(alias="_links")
+
+
+@dataclass(kw_only=True, slots=True)
+class EventHistoryEvent:
+	eventTimestamp: int | float | None = None
+	sensorSerial: str | None = None
+	video: dict[str, EventVideo] | None = None
+	videoStartedBy: str | None = None
+
+
+@dataclass(kw_only=True, slots=True)
+class EventHistoryResponse:
+	events: list[EventHistoryEvent]
+
+
 class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 	WebRTCClientConfigurationMixin,
 	SimpliSafeEntity,
@@ -131,8 +154,41 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		width: int | None = None,
 		height: int | None = None,
 	) -> bytes | None:
-		"""Return a camera image."""
-		_ = width, height
+		"""Return the latest snapshot from this camera's event history."""
+		_ = height
+		history = TypeAdapter(EventHistoryResponse).validate_python(
+			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
+				"get",
+				f"subscriptions/{self._system.system_id}/events?numEvents=50",
+			)
+		)
+
+		camera_serials = {self._device.serial}
+		if isinstance(camera_data := self._system.camera_data.get(self._device.serial), Mapping):
+			for key in ("uuid", "serial"):
+				if isinstance(serial := camera_data.get(key), str):
+					camera_serials.add(serial)
+
+		newest_video: EventVideo | None = None
+		newest_timestamp = 0
+		for event in history.events:
+			if event.sensorSerial not in camera_serials:
+				continue
+			if event.video is None or event.videoStartedBy is None:
+				continue
+			if not (video := event.video.get(event.videoStartedBy)):
+				continue
+			if (timestamp := event.eventTimestamp or 0) <= newest_timestamp:
+				continue
+			newest_video, newest_timestamp = video, timestamp
+
+		if newest_video and (snapshot := newest_video.links.get("snapshot/jpg")):
+			return await self._simplisafe._api.async_media(  # pyright: ignore[reportPrivateUsage]
+				snapshot.href.replace(
+					"{&width}", f"&width={width}" if width is not None else ""
+				)
+			)
+
 		return None
 
 	async def _create_stream(self, response_type: type[_StreamResponseT]) -> _StreamResponseT:
