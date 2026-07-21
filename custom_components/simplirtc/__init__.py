@@ -22,6 +22,7 @@ from homeassistant.helpers import (
 )
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.setup import async_when_setup
 from homeassistant.components.simplisafe import (
 	DOMAIN as SIMPLISAFE_DOMAIN,
 	SimpliSafe,
@@ -31,7 +32,7 @@ from .const import (
 	DOMAIN,
 	ATTR_CONFIG_ENTRY_ID,
 )
-from .web import SimpliRTCStreamInfoView
+from .webrtc import async_register_webrtc_client_config_handler
 
 PLATFORMS = [
 	Platform.CAMERA,
@@ -44,10 +45,12 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 	"""Set up the Simplirtc component."""
+	async_when_setup(
+		hass, Platform.CAMERA, async_register_webrtc_client_config_handler
+	)
+
 	if DOMAIN not in config:
 		return True
-
-	hass.http.register_view(SimpliRTCStreamInfoView(hass))
 
 	@callback
 	def async_config_entry_changed(change: ConfigEntryChange, entry: ConfigEntry) -> None:

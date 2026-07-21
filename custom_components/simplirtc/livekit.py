@@ -7,7 +7,6 @@ import base64
 from collections.abc import (
 	AsyncGenerator,
 	AsyncIterator,
-	Awaitable,
 	Callable,
 	Iterable,
 )
@@ -15,8 +14,9 @@ from contextlib import asynccontextmanager
 import gzip
 import json
 import logging
+from secrets import token_hex
 import time
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, override
 from urllib.parse import urlencode
 
 from aiohttp import (
@@ -24,6 +24,12 @@ from aiohttp import (
 	ClientWebSocketResponse,
 	WSMsgType,
 )
+from homeassistant.components.camera import (
+	WebRTCAnswer,  # pyright: ignore[reportPrivateImportUsage]
+	WebRTCCandidate,  # pyright: ignore[reportPrivateImportUsage]
+	WebRTCSendMessage,  # pyright: ignore[reportPrivateImportUsage]
+)
+from webrtc_models import RTCIceCandidateInit
 
 from .vendor.aiortc import (
 	RTCBundlePolicy,
@@ -59,6 +65,7 @@ from .protobufs.livekit_rtc_pb2 import (
 	TrickleRequest,
 	WrappedJoinRequest,
 )
+from .webrtc import MessageQueue, SimpliSafeWebRTCSession
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,11 +76,8 @@ _CAMERA_TRACK_KIND_BY_TYPE_SOURCE = {
 	(VIDEO, CAMERA): "video",
 }
 
-SendAnswer = Callable[[SessionDescription], None]
-SendCandidate = Callable[[TrickleRequest], None]
-CandidateSender = Callable[[TrickleRequest], Awaitable[None]]
 SessionClosedCallback = Callable[[], None]
-OnIceServers = Callable[[list[ICEServer]], None]
+SendIceServers = Callable[[list[ICEServer]], None]
 LiveKitSignalMessage: TypeAlias = (
 	tuple[Literal["join"], JoinResponse]
 	| tuple[Literal["answer"], SessionDescription]
@@ -89,67 +93,19 @@ LiveKitSignalMessage: TypeAlias = (
 )
 
 
-async def fetch_ice_servers(livekit_url: str, user_token: str) -> list[ICEServer]:
-	"""Fetch the ICE servers LiveKit returns in its initial join response."""
-	logger = _LOGGER.getChild("ice")
-	async with LiveKitSignalConnection.connect(
-		livekit_url,
-		token=user_token,
-		session_id="ice-config",
-		auto_subscribe=False,
-		logger=logger,
-	) as signal:
-		async for message in signal.responses():
-			match message:
-				case ("join", join):
-					await signal.send(SignalRequest(leave=LeaveRequest()))
-					return list(join.ice_servers)
-				case ("leave", leave):
-					raise RuntimeError(
-						f"LiveKit left before join response: reason={leave.reason}"
-					)
-				case _:
-					continue
-
-	raise RuntimeError("LiveKit closed before sending a join response")
-
-
-class CandidateQueue:
-	"""Queue ICE candidates until signaling is ready to send them."""
-
-	def __init__(self) -> None:
-		self._pending: list[TrickleRequest] = []
-		self._sender: CandidateSender | None = None
-
-	async def add(self, candidate: TrickleRequest) -> None:
-		"""Add a candidate or send it immediately after flush."""
-		if self._sender is None:
-			self._pending.append(candidate)
-			return
-		await self._sender(candidate)
-
-	async def flush(self, sender: CandidateSender) -> None:
-		"""Send queued candidates and use sender for future additions."""
-		self._sender = sender
-		pending = self._pending
-		self._pending = []
-		for candidate in pending:
-			await sender(candidate)
-
-
-class LiveKitSignalConnection:
-	"""A wrapped LiveKit websocket connection that emits protobuf responses."""
+class LiveKitSignal:
+	"""A wrapped LiveKit websocket signal task."""
 
 	def __init__(
 		self,
 		*,
-		session_id: str,
 		ws: ClientWebSocketResponse,
 		logger: logging.Logger,
+		task_group: asyncio.TaskGroup,
 	) -> None:
-		self.session_id = session_id
 		self._ws = ws
 		self._logger = logger
+		self._task_group = task_group
 		self._ping_task: asyncio.Task[None] | None = None
 
 	@classmethod
@@ -159,12 +115,41 @@ class LiveKitSignalConnection:
 		url: str,
 		*,
 		token: str,
-		session_id: str,
 		auto_subscribe: bool,
 		logger: logging.Logger,
 		offer_sdp: str | None = None,
-	) -> AsyncGenerator[LiveKitSignalConnection]:
-		"""Connect to LiveKit signaling for a wrapped join request."""
+	) -> AsyncGenerator[LiveKitSignal, None]:
+		"""Connect to LiveKit signaling and yield a running signal."""
+		async with (
+			asyncio.TaskGroup() as task_group,
+			ClientSession() as http_session,
+			http_session.ws_connect(
+				cls._join_url(
+					url,
+					auto_subscribe=auto_subscribe,
+					offer_sdp=offer_sdp,
+				),
+				headers={"Authorization": f"Bearer {token}"},
+			) as ws,
+		):
+			yield cls(
+				ws=ws,
+				logger=logger,
+				task_group=task_group,
+			)
+
+	def __aiter__(self) -> AsyncIterator[LiveKitSignalMessage]:
+		"""Iterate over parsed LiveKit signaling messages."""
+		return self.messages()
+
+	@staticmethod
+	def _join_url(
+		url: str,
+		*,
+		auto_subscribe: bool,
+		offer_sdp: str | None = None,
+	) -> str:
+		"""Return the wrapped LiveKit join URL."""
 		join_request = JoinRequest(
 			client_info=ClientInfo(
 				sdk=ClientInfo.JS,
@@ -180,33 +165,13 @@ class LiveKitSignalConnection:
 			compression=WrappedJoinRequest.GZIP,
 			join_request=gzip.compress(join_request.SerializeToString()),
 		)
-		async with (
-			ClientSession() as http_session,
-			http_session.ws_connect(
-				f"{url.rstrip('/')}/rtc?{urlencode({
-					'join_request': base64.urlsafe_b64encode(
-						wrapped_join_request.SerializeToString()
-					).decode(),
-				})}",
-				headers={"Authorization": f"Bearer {token}"},
-			) as ws,
-			cls(session_id=session_id, ws=ws, logger=logger) as signal,
-		):
-			yield signal
+		return f"{url.rstrip('/')}/rtc?{urlencode({
+			'join_request': base64.urlsafe_b64encode(
+				wrapped_join_request.SerializeToString()
+			).decode(),
+		})}"
 
-	async def __aenter__(self) -> LiveKitSignalConnection:
-		return self
-
-	async def __aexit__(self, *_exc_info: object) -> None:
-		self.close()
-
-	def close(self) -> None:
-		"""Stop background ping for this websocket session."""
-		if ping_task := self._ping_task:
-			self._ping_task = None
-			ping_task.cancel()
-
-	async def responses(self) -> AsyncIterator[LiveKitSignalMessage]:
+	async def messages(self) -> AsyncIterator[LiveKitSignalMessage]:
 		"""Yield parsed LiveKit SignalResponse messages."""
 		async for msg in self._ws:
 			if msg.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
@@ -222,35 +187,39 @@ class LiveKitSignalConnection:
 				self._logger.error("Error parsing LiveKit SignalResponse: %s", err)
 				continue
 
-			kind = response.WhichOneof("message")
-			match kind:
-				case "join":
-					self._start_ping(response.join.ping_interval)
-					yield kind, response.join
-				case "answer":
-					yield kind, response.answer
-				case "offer":
-					yield kind, response.offer
-				case "trickle":
-					yield kind, response.trickle
-				case "update":
-					yield kind, response.update
-				case "media_sections_requirement":
-					yield kind, response.media_sections_requirement
-				case "leave":
-					yield kind, response.leave
-				case "subscription_permission_update":
-					yield kind, response.subscription_permission_update
-				case "subscription_response":
-					yield kind, response.subscription_response
-				case "pong_resp":
-					yield kind, response.pong_resp
-				case _:
-					self._logger.debug(
-						"Unhandled LiveKit signaling response: %s",
-						response,
-					)
-					yield "response", response
+			yield self._response_message(response)
+
+	def _response_message(
+		self, response: SignalResponse,
+	) -> LiveKitSignalMessage:
+		match kind := response.WhichOneof("message"):
+			case "join":
+				self._start_ping(response.join.ping_interval)
+				return kind, response.join
+			case "answer":
+				return kind, response.answer
+			case "offer":
+				return kind, response.offer
+			case "trickle":
+				return kind, response.trickle
+			case "update":
+				return kind, response.update
+			case "media_sections_requirement":
+				return kind, response.media_sections_requirement
+			case "leave":
+				return kind, response.leave
+			case "subscription_permission_update":
+				return kind, response.subscription_permission_update
+			case "subscription_response":
+				return kind, response.subscription_response
+			case "pong_resp":
+				return kind, response.pong_resp
+			case _:
+				self._logger.debug(
+					"Unhandled LiveKit signaling response: %s",
+					response,
+				)
+				return "response", response
 
 	async def send(self, request: SignalRequest) -> None:
 		"""Send a protobuf request on this websocket."""
@@ -265,32 +234,25 @@ class LiveKitSignalConnection:
 			)
 		if self._ping_task is not None:
 			return
-		self._ping_task = asyncio.create_task(
+		self._ping_task = self._task_group.create_task(
 			self._ping_loop(interval_seconds),
-			name=f"simplirtc-livekit-ping-{self.session_id}",
+			name="simplirtc-livekit-ping",
 		)
-		self._ping_task.add_done_callback(self._log_ping_task_error)
 
 	async def _ping_loop(self, interval_seconds: int) -> None:
-		while not self._ws.closed:
-			await asyncio.sleep(interval_seconds)
-			await self.send(
-				SignalRequest(ping_req=Ping(timestamp=int(time.time() * 1000)))
-			)
-
-	def _log_ping_task_error(self, task: asyncio.Task[None]) -> None:
-		if self._ping_task is task:
-			self._ping_task = None
-		if task.cancelled():
-			return
 		try:
-			task.result()
+			while not self._ws.closed:
+				await asyncio.sleep(interval_seconds)
+				await self.send(
+					SignalRequest(ping_req=Ping(timestamp=int(time.time() * 1000)))
+				)
+		except asyncio.CancelledError:
+			raise
 		except Exception as err:
-			self._logger.error(
-				"LiveKit session %s ping failed: %s",
-				self.session_id,
-				err,
-			)
+			self._logger.error("LiveKit ping failed: %s", err)
+			raise
+		finally:
+			self._ping_task = None
 
 
 class WarmupSession:
@@ -298,7 +260,7 @@ class WarmupSession:
 
 	def __init__(
 		self,
-		signal: LiveKitSignalConnection,
+		signal: LiveKitSignal,
 		*,
 		ice_servers: Iterable[ICEServer],
 	) -> None:
@@ -325,50 +287,47 @@ class WarmupSession:
 		self._track_sid_by_kind: dict[str, str] = {}
 		self._allowed_track_sids: set[str] = set()
 
-	async def run(
-		self,
-		responses: AsyncIterator[LiveKitSignalMessage],
-	) -> None:
+	async def run(self) -> None:
 		"""Run warmup until camera tracks are published and allowed."""
 		try:
 			await self._send_peer_offer()
-			await self._read_until_camera_tracks_allowed(responses)
+			async for message in self._signal:
+				match message:
+					case ("answer", answer):
+						await self._on_answer(answer)
+					case ("trickle", trickle):
+						await self._on_trickle(trickle)
+					case ("media_sections_requirement", _):
+						await self._send_peer_offer()
+					case ("update", update):
+						self._on_participant_update(update)
+					case ("subscription_permission_update", update):
+						self._on_subscription_permission_update(update)
+					case ("subscription_response", response):
+						if response.err:
+							self._logger.warning(
+								"LiveKit aiortc warmup subscription failed: track=%s error=%s",
+								response.track_sid,
+								response.err,
+							)
+					case ("pong_resp", _):
+						pass
+					case (kind, response):
+						self._logger.debug(
+							"Unhandled LiveKit aiortc warmup message kind=%s response=%s",
+							kind,
+							response,
+						)
+
+				if not self._waiting_for_track_permissions:
+					return
+
+			raise RuntimeError(
+				"LiveKit aiortc warmup websocket closed before camera track permissions were allowed: waiting_for="
+				f"{sorted(self._waiting_for_track_permissions)}"
+			)
 		finally:
 			await self._peer_connection.close()
-
-	async def _read_until_camera_tracks_allowed(
-		self,
-		responses: AsyncIterator[LiveKitSignalMessage],
-	) -> None:
-		"""Read warmup signaling until camera tracks are allowed or the socket closes."""
-		async for message in responses:
-			match message:
-				case ("answer", answer):
-					await self._on_answer(answer)
-				case ("trickle", trickle):
-					await self._on_trickle(trickle)
-				case ("media_sections_requirement", _):
-					await self._send_peer_offer()
-				case ("update", update):
-					self._on_participant_update(update)
-				case ("subscription_permission_update", subscription_permission_update):
-					self._on_subscription_permission_update(
-						subscription_permission_update
-					)
-				case ("subscription_response", subscription_response):
-					if subscription_response.err:
-						self._logger.warning(
-							"LiveKit aiortc warmup subscription failed: track=%s error=%s",
-							subscription_response.track_sid,
-							subscription_response.err,
-						)
-				case (_, _):
-					self._logger.debug(f"Unhandled LiveKit aiortc warmup message kind={message[0]}")
-
-			if not self._waiting_for_track_permissions:
-				return
-
-		raise RuntimeError(f"LiveKit aiortc warmup websocket closed before camera track permissions were allowed: waiting_for={sorted(self._waiting_for_track_permissions)}")
 
 	async def _send_peer_offer(self) -> None:
 		await self._peer_connection.setLocalDescription()
@@ -451,211 +410,234 @@ class WarmupSession:
 				return track_kind
 		return None
 
-
-class LiveKitSession:
+class LiveKitSession(SimpliSafeWebRTCSession):
 	"""A browser-offer LiveKit signaling session for Home Assistant."""
 
 	def __init__(
 		self,
 		*,
-		session_id: str,
 		livekit_url: str,
 		user_token: str,
-		offer_sdp: str,
-		send_answer: SendAnswer,
-		send_candidate: SendCandidate,
-		on_close: SessionClosedCallback | None = None,
-		on_ice_servers: OnIceServers | None = None,
+		send_ice_servers: SendIceServers,
 	) -> None:
-		self.session_id = session_id
 		self._livekit_url = livekit_url
 		self._user_token = user_token
-		self._offer_sdp = offer_sdp
-		self._send_answer = send_answer
-		self._send_candidate = send_candidate
-		self._on_close = on_close
-		self._on_ice_servers = on_ice_servers
-		self._logger = _LOGGER.getChild(f"session.{session_id}")
+		self._send_ice_servers = send_ice_servers
+		self._id = token_hex(4)
+		self._send_message: WebRTCSendMessage | None = None
+		self._on_close: SessionClosedCallback | None = None
+		self._logger = _LOGGER.getChild(f"session.{self._id}")
 
+		self._offer_sdp: str | None = None
 		self._reader_task: asyncio.Task[None] | None = None
-		self._candidate_queue = CandidateQueue()
+		self._request_queue = MessageQueue[SignalRequest]()
 
-	async def start(self) -> None:
-		"""Start LiveKit signaling."""
+	@override
+	def start(self, on_close: SessionClosedCallback) -> None:
+		"""Start the no-offer LiveKit join used for ICE and optional warmup."""
 		if self._reader_task is not None:
-			raise RuntimeError(f"LiveKit session {self.session_id} already started")
+			raise RuntimeError(f"LiveKit session {self._id} already started")
 
-		self._reader_task = task = asyncio.create_task(
-			self._read(),
-			name=f"simplirtc-livekit-{self.session_id}",
+		self._on_close = on_close
+
+		async def reader_task() -> None:
+			try:
+				await self._read()
+			except Exception as err:
+				self._logger.error("Error in LiveKit session: %s", err)
+			finally:
+				self._reader_task = None
+				self.close()
+
+		self._reader_task = asyncio.create_task(
+			reader_task(),
+			name=f"simplirtc-livekit-{self._id}",
 		)
-		task.add_done_callback(self._log_task_error)
 
-	async def send_candidate(
-		self,
-		candidate: TrickleRequest,
-	) -> None:
+	@override
+	async def handle_offer(self, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
+		"""Handle a browser offer with the prepared LiveKit session."""
+		if self._reader_task is None:
+			raise RuntimeError(f"LiveKit session {self._id} was not started")
+		self._send_message = send_message
+		self._offer_sdp = offer_sdp
+		await self._request_queue.add(SignalRequest(offer=SessionDescription(
+			type="offer",
+			sdp=offer_sdp,
+		)))
+
+	@override
+	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
 		"""Forward a browser ICE candidate to LiveKit."""
-		await self._candidate_queue.add(candidate)
+		# LiveKit rejects the browser's final null ICE event if it is serialized
+		# as an empty candidateInit, and the session works without forwarding it.
+		if not candidate.candidate:
+			return
 
+		candidate_init: dict[str, str | int] = {"candidate": candidate.candidate}
+		if candidate.sdp_mid is not None:
+			candidate_init["sdpMid"] = candidate.sdp_mid
+		if candidate.sdp_m_line_index is not None:
+			candidate_init["sdpMLineIndex"] = candidate.sdp_m_line_index
+
+		await self._request_queue.add(SignalRequest(
+			trickle=TrickleRequest(
+				candidateInit=json.dumps(candidate_init, separators=(",", ":")),
+				target=SignalTarget.PUBLISHER,
+			),
+		))
+
+	@override
 	def close(self) -> None:
-		"""Close this LiveKit signaling session."""
-		if reader_task := self._reader_task:
+		"""Stop this LiveKit signaling session."""
+		self._request_queue.clear()
+		if (reader_task := self._reader_task) is not None:
 			self._reader_task = None
 			reader_task.cancel()
-
-	def _log_task_error(self, task: asyncio.Task[None]) -> None:
-		if self._reader_task is task:
-			self._reader_task = None
-		if task.cancelled():
-			return
-		try:
-			task.result()
-		except Exception as err:
-			self._logger.error("LiveKit session %s failed: %s", self.session_id, err)
+		if on_close := self._on_close:
+			self._on_close = None
+			on_close()
 
 	async def _read(self) -> None:
-		try:
-			await self._run_browser_session()
-		finally:
-			self._reader_task = None
-			if self._on_close:
-				self._on_close()
-
-	async def _run_browser_session(self) -> None:
-		async with LiveKitSignalConnection.connect(
+		"""Run initial signaling, optional warmup, and browser signaling."""
+		async with LiveKitSignal.connect(
 			self._livekit_url,
 			token=self._user_token,
-			session_id=self.session_id,
 			auto_subscribe=True,
-			logger=self._logger,
+			logger=self._logger.getChild("initial"),
 		) as signal:
-			responses = signal.responses()
-			async for message in responses:
+			async for message in signal:
 				match message:
 					case ("join", join):
-						if (
-							(on_ice_servers := self._on_ice_servers)
-							and (ice_servers := list(join.ice_servers))
-						):
-							on_ice_servers(ice_servers)
-						has_audio = any(
-							track.sid
-							and track.type == AUDIO
-							and track.source == MICROPHONE
-							for participant in join.other_participants
-							for track in participant.tracks
-						)
-						has_video = any(
-							track.sid
-							and track.type == VIDEO
-							and track.source == CAMERA
-							for participant in join.other_participants
-							for track in participant.tracks
-						)
-
-						if has_audio and has_video:
-							await signal.send(SignalRequest(offer=SessionDescription(type="offer", sdp=self._offer_sdp)))
-							await self._continue_browser_session(responses, signal)
-							return
-
-						try:
-							warmup = WarmupSession(signal, ice_servers=join.ice_servers)
-							await warmup.run(responses)
-						except Exception:
-							self._logger.exception("LiveKit aiortc warmup failed; continuing with browser offer")
-
 						break
 					case ("leave", leave):
-						raise RuntimeError(f"LiveKit left before join response: reason={leave.reason}")
-					case (_, _):
-						raise RuntimeError(f"LiveKit sent {message[0]} before join response")
+						raise RuntimeError(
+							f"LiveKit left before join response: reason={leave.reason}"
+						)
+					case (kind, _):
+						raise RuntimeError(f"LiveKit sent {kind} before join response")
 			else:
 				raise RuntimeError("LiveKit websocket closed before join response")
 
-		async with LiveKitSignalConnection.connect(
+			ice_servers = list(join.ice_servers)
+			self._send_ice_servers(ice_servers)
+
+			if all(
+				any(
+					track.sid
+					and (track.type, track.source) == required_track
+					for participant in join.other_participants
+					for track in participant.tracks
+				)
+				for required_track in _CAMERA_TRACK_KIND_BY_TYPE_SOURCE
+			):
+				await self._request_queue.flush(signal.send)
+				await self._run_browser_signal(signal)
+				return
+
+			try:
+				await WarmupSession(signal, ice_servers=ice_servers).run()
+			except Exception as err:
+				self._logger.warning(
+					"LiveKit aiortc warmup failed; continuing with browser offer: %s",
+					err,
+				)
+
+		async with LiveKitSignal.connect(
 			self._livekit_url,
 			token=self._user_token,
-			session_id=self.session_id,
 			auto_subscribe=True,
-			logger=self._logger,
-			offer_sdp=self._offer_sdp,
+			logger=self._logger.getChild("browser"),
 		) as signal:
-			responses = signal.responses()
-			async for message in responses:
-				match message:
-					case ("join", join):
-						if (
-							(on_ice_servers := self._on_ice_servers)
-							and (ice_servers := list(join.ice_servers))
-						):
-							on_ice_servers(ice_servers)
-						await self._continue_browser_session(responses, signal)
-						return
-					case ("leave", leave):
-						raise RuntimeError(f"LiveKit left before join response: reason={leave.reason}")
-					case (_, _):
-						raise RuntimeError(f"LiveKit sent {message[0]} before join response")
+			await self._run_browser_signal(signal)
 
-			raise RuntimeError("LiveKit websocket closed before join response")
+	async def _run_browser_signal(self, signal: LiveKitSignal) -> None:
+		"""Handle LiveKit signaling for the browser-owned peer connection."""
 
-	async def _continue_browser_session(
-		self,
-		responses: AsyncIterator[LiveKitSignalMessage],
-		signal: LiveKitSignalConnection,
-	) -> None:
-		async for message in responses:
+		async for message in signal:
 			match message:
 				case ("join", _):
-					self._logger.warning(
-						"Ignoring unexpected LiveKit join after browser offer"
-					)
+					await self._request_queue.flush(signal.send)
 				case ("answer", answer):
-					await self._on_answer(answer, signal)
+					self._on_answer(answer)
 				case ("trickle", trickle):
 					self._on_trickle(trickle)
-				case ("media_sections_requirement", media_sections_requirement):
-					self._on_media_sections_requirement(media_sections_requirement)
+				case ("media_sections_requirement", requirement):
+					await self._on_media_sections_requirement(requirement)
 				case ("leave", leave):
 					self._logger.warning(
-						"LiveKit requested session leave: reason=%s action=%s can_reconnect=%s",
+						"LiveKit browser signal left: reason=%s",
 						leave.reason,
-						leave.action,
-						leave.can_reconnect,
 					)
-				case ("subscription_permission_update", _):
-					pass
-				case ("subscription_response", subscription_response):
-					if subscription_response.err:
+				case ("subscription_response", response):
+					if response.err:
 						self._logger.warning(
-							"LiveKit subscription failed: track=%s error=%s",
-							subscription_response.track_sid,
-							subscription_response.err,
+							"LiveKit browser subscription failed: track=%s error=%s",
+							response.track_sid,
+							response.err,
 						)
-				case ("offer", _):
-					self._logger.warning(
-						"Ignoring unexpected LiveKit offer in browser-offer session"
-					)
 				case ("pong_resp", _):
 					pass
-				case (_, _):
-					self._logger.debug(f"Unhandled LiveKit signaling message kind={message[0]}")
+				case (kind, response):
+					self._logger.debug(
+						"Unhandled LiveKit browser message kind=%s response=%s",
+						kind,
+						response,
+					)
 
-	async def _on_answer(self, answer: SessionDescription, signal: LiveKitSignalConnection) -> None:
-		await self._candidate_queue.flush(
-			lambda candidate: signal.send(SignalRequest(trickle=candidate))
-		)
-		self._send_answer(answer)
+		if not self._request_queue.flushed:
+			raise RuntimeError("LiveKit websocket closed before join response")
+
+	def _on_answer(self, answer: SessionDescription) -> None:
+		if send_message := self._send_message:
+			send_message(WebRTCAnswer(answer=answer.sdp))
 
 	def _on_trickle(self, trickle: TrickleRequest) -> None:
 		if trickle.target != SignalTarget.PUBLISHER:
 			return
 
-		self._send_candidate(trickle)
+		if trickle.final and not trickle.candidateInit:
+			if send_message := self._send_message:
+				send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
+					candidate="",
+					sdp_mid=None,
+					sdp_m_line_index=None,
+				)))
+			return
+		if not trickle.candidateInit:
+			return
 
-	def _on_media_sections_requirement(
+		try:
+			candidate_init = json.loads(trickle.candidateInit)
+		except ValueError as err:
+			self._logger.warning("Dropping invalid LiveKit ICE candidate JSON: %s", err)
+			return
+
+		candidate = candidate_init.get("candidate")
+		if not isinstance(candidate, str):
+			self._logger.warning("Dropping LiveKit ICE candidate without candidate field")
+			return
+		sdp_mid = candidate_init.get("sdpMid")
+		sdp_m_line_index = candidate_init.get("sdpMLineIndex")
+		if send_message := self._send_message:
+			send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
+				candidate=candidate,
+				sdp_mid=sdp_mid if isinstance(sdp_mid, str) else None,
+				sdp_m_line_index=(
+					sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
+				),
+			)))
+
+	async def _on_media_sections_requirement(
 		self,
 		requirement: MediaSectionsRequirement,
 	) -> None:
 		if requirement.num_audios or requirement.num_videos:
 			self._logger.warning(f"LiveKit requested extra media sections audio={requirement.num_audios} video={requirement.num_videos}; Home Assistant cannot apply renegotiation")
+		if self._offer_sdp is None:
+			self._logger.warning("LiveKit requested media sections before browser offer")
+			return
+		await self._request_queue.add(SignalRequest(offer=SessionDescription(
+			type="offer",
+			sdp=self._offer_sdp,
+		)))
