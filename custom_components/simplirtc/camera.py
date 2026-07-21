@@ -239,6 +239,11 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		if provider := settings.get("webRTCProvider"):  # pyright: ignore[reportUnknownMemberType]
 			return str(provider)
 
+	@property
+	def extra_state_attributes(self) -> dict[str, str | None]:
+		"""Return camera-specific state attributes."""
+		return {"webrtc_provider": self._web_rtc_provider}
+
 	async def async_prepare_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
 		"""Create an unused provider session and return its client configuration."""
 		ice_servers: list[KinesisIceServer | LiveKitIceServer] = []
