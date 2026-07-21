@@ -14,6 +14,7 @@ from simplipy.device.camera import Camera
 from simplipy.system.v3 import SystemV3
 from simplipy.websocket import (
 	EVENT_CAMERA_MOTION_DETECTED,
+	WebsocketEvent,
 )
 from webrtc_models import (
 	RTCIceCandidateInit,
@@ -147,6 +148,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		self._unused_session_expirations: dict[
 			SimpliSafeWebRTCSession, asyncio.TimerHandle
 		] = {}
+		self._snapshot_template_url: str | None = None
 
 	@override
 	async def async_camera_image(
@@ -156,6 +158,20 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 	) -> bytes | None:
 		"""Return the latest snapshot from this camera's event history."""
 		_ = height
+		if self._snapshot_template_url is None:
+			await self._async_refresh_snapshot_template_url()
+
+		if snapshot_template_url := self._snapshot_template_url:
+			return await self._simplisafe._api.async_media(  # pyright: ignore[reportPrivateUsage]
+				snapshot_template_url.replace(
+					"{&width}", f"&width={width}" if width is not None else ""
+				)
+			)
+
+		return None
+
+	async def _async_refresh_snapshot_template_url(self) -> None:
+		"""Update the cached snapshot template from this camera's event history."""
 		history = TypeAdapter(EventHistoryResponse).validate_python(
 			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
 				"get",
@@ -163,14 +179,9 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 			)
 		)
 
-		camera_serials = {self._device.serial}
-		if isinstance(camera_data := self._system.camera_data.get(self._device.serial), Mapping):
-			for key in ("uuid", "serial"):
-				if isinstance(serial := camera_data.get(key), str):
-					camera_serials.add(serial)
-
 		newest_video: EventVideo | None = None
 		newest_timestamp = 0
+		camera_serials = self._camera_event_serials()
 		for event in history.events:
 			if event.sensorSerial not in camera_serials:
 				continue
@@ -183,13 +194,35 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 			newest_video, newest_timestamp = video, timestamp
 
 		if newest_video and (snapshot := newest_video.links.get("snapshot/jpg")):
-			return await self._simplisafe._api.async_media(  # pyright: ignore[reportPrivateUsage]
-				snapshot.href.replace(
-					"{&width}", f"&width={width}" if width is not None else ""
-				)
-			)
+			self._snapshot_template_url = snapshot.href
 
-		return None
+	@override
+	@callback
+	def async_update_from_websocket_event(self, event: WebsocketEvent) -> None:
+		"""Cache the snapshot template from a camera motion event."""
+		if event.media_urls and (url := event.media_urls.get("image_url")):
+			self._snapshot_template_url = url
+
+	@override
+	@callback
+	def _handle_websocket_update(self, event: WebsocketEvent) -> None:
+		"""Ignore camera motion events for other cameras."""
+		if (
+			event.event_type == EVENT_CAMERA_MOTION_DETECTED
+			and event.sensor_serial not in self._camera_event_serials()
+		):
+			return
+		super()._handle_websocket_update(event)
+
+	@callback
+	def _camera_event_serials(self) -> set[str]:
+		"""Return camera identifiers that may appear in events."""
+		serials = {self._device.serial}
+		if isinstance(camera_data := self._system.camera_data.get(self._device.serial), Mapping):
+			for key in ("uuid", "serial"):
+				if isinstance(serial := camera_data.get(key), str) and serial:
+					serials.add(serial)
+		return serials
 
 	async def _create_stream(self, response_type: type[_StreamResponseT]) -> _StreamResponseT:
 		return TypeAdapter(response_type).validate_python(
