@@ -35,6 +35,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from . import webapp_token
 from .kinesis import KinesisSession
 from .livekit import LiveKitSession
 from .protobufs.livekit_rtc_pb2 import ICEServer as LiveKitIceServer
@@ -225,9 +226,16 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		return serials
 
 	async def _create_stream(self, response_type: type[_StreamResponseT]) -> _StreamResponseT:
+		path = f"cameras/{self._device.serial}/{self._system.system_id}/live-view"
+		# SimpliSafe now 404s live-view for the iOS-app client token the SimpliSafe integration uses, while a
+		# web-app client token works. Use one when it has been set up (see webapp_token.py), else the original route.
+		if webapp_token.available(self.hass):
+			return TypeAdapter(response_type).validate_python(
+				await webapp_token.async_live_view(self.hass, f"{WEBRTC_URL_BASE}/{path}")
+			)
 		return TypeAdapter(response_type).validate_python(
 			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
-				"get", f"cameras/{self._device.serial}/{self._system.system_id}/live-view",
+				"get", path,
 				url_base=WEBRTC_URL_BASE,
 			)
 		)

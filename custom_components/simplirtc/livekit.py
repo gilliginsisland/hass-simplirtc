@@ -429,6 +429,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 		self._logger = _LOGGER.getChild(f"session.{self._id}")
 
 		self._offer_sdp: str | None = None
+		self._answer_sent = False
 		self._reader_task: asyncio.Task[None] | None = None
 		self._request_queue = MessageQueue[SignalRequest]()
 
@@ -589,7 +590,14 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 			raise RuntimeError("LiveKit websocket closed before join response")
 
 	def _on_answer(self, answer: SessionDescription) -> None:
+		# Only the first answer can be applied: the browser's peer connection is "stable" after it, and Home
+		# Assistant cannot renegotiate. LiveKit answers again when the offer is re-sent for a media sections
+		# requirement; forwarding that second answer makes the browser fail with "Called in wrong state: stable".
+		if self._answer_sent:
+			self._logger.debug("Ignoring additional LiveKit answer (browser connection already stable)")
+			return
 		if send_message := self._send_message:
+			self._answer_sent = True
 			send_message(WebRTCAnswer(answer=answer.sdp))
 
 	def _on_trickle(self, trickle: TrickleRequest) -> None:
