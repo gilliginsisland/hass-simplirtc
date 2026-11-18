@@ -10,6 +10,7 @@ import pytest
 from aiohttp import web
 from homeassistant.components.camera import WebRTCAnswer
 
+from custom_components.simplirtc import camera as camera_module
 from custom_components.simplirtc.camera import SimpliSafeCamera
 from custom_components.simplirtc.kinesis import KinesisSession
 from custom_components.simplirtc.livekit import LiveKitSession, WarmupSession
@@ -209,6 +210,7 @@ async def test_warmup_peer_is_closed_on_cancellation():
 @pytest.mark.asyncio
 async def test_camera_removal_waits_for_active_and_prepared_sessions():
     camera = SimpliSafeCamera.__new__(SimpliSafeCamera)
+    camera._sfu_room = None
     camera._provider_sessions = set()
     camera._unused_sessions = {}
     camera._sessions = {}
@@ -306,6 +308,7 @@ async def test_session_context_exits_only_after_resources_close(raise_in_body):
 @pytest.mark.asyncio
 async def test_camera_ignores_late_candidates_while_session_is_closing():
     camera = SimpliSafeCamera.__new__(SimpliSafeCamera)
+    camera._sfu_room = None
     camera._provider_sessions = set()
     camera._unused_sessions = {}
     camera._sessions = {}
@@ -327,6 +330,7 @@ async def test_camera_ignores_late_candidates_while_session_is_closing():
 @pytest.mark.parametrize('provider,cancel_prepare', [('mist', False), ('mist', True), ('kvs', False)])
 async def test_camera_preparation_uses_managed_owner_and_handles_cancellation(provider, cancel_prepare):
     camera = SimpliSafeCamera.__new__(SimpliSafeCamera)
+    camera._sfu_room = None
     camera.hass = SimpleNamespace(loop=asyncio.get_running_loop())
     camera.entity_id = 'camera.test'
     camera._provider_sessions = set()
@@ -354,8 +358,8 @@ async def test_camera_preparation_uses_managed_owner_and_handles_cancellation(pr
             await read()
         session._read = receive
         return session
-    with patch.object(SimpliSafeCamera, '_web_rtc_provider', new_callable=PropertyMock, return_value=provider), patch(
-        'custom_components.simplirtc.camera.LiveKitSession', side_effect=factory,
+    with patch.object(SimpliSafeCamera, '_web_rtc_provider', new_callable=PropertyMock, return_value=provider), patch.object(
+        camera_module, 'SfuSession' if hasattr(camera_module, 'SfuSession') else 'LiveKitSession', side_effect=factory,
     ), patch('custom_components.simplirtc.camera.KinesisSession', side_effect=factory):
         prepare = asyncio.create_task(camera.async_prepare_webrtc_client_configuration())
         await session.entered.wait()

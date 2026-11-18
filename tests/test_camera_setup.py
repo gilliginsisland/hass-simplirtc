@@ -16,7 +16,7 @@ from custom_components.simplirtc.camera import SimpliSafeCamera
 async def test_entity_platform_links_the_existing_device_without_registering_one():
     assert PLATFORMS == [Platform.CAMERA]
     parent = SimpleNamespace(id='native-camera', name='User camera name', model='Native model')
-    camera = SimpleNamespace(serial='camera-uuid')
+    camera = SimpleNamespace(serial='camera-uuid', camera_settings={})
     # Isolate core's API/coordinator setup; exercise the real SimpliRTC constructor
     # and HA's entity-platform attachment path.
     def init_native(self, *args, **kwargs):
