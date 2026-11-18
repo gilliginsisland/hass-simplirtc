@@ -102,15 +102,13 @@ class EventMediaLink:
 
 @dataclass(kw_only=True, slots=True)
 class EventVideo:
-	links: dict[str, EventMediaLink] = Field(alias="_links")
+	links: dict[str, EventMediaLink] = Field(default_factory=dict, alias="_links")
 
 
 @dataclass(kw_only=True, slots=True)
 class EventHistoryEvent:
 	eventTimestamp: int | float | None = None
-	sensorSerial: str | None = None
 	video: dict[str, EventVideo] | None = None
-	videoStartedBy: str | None = None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -171,7 +169,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		return None
 
 	async def _async_refresh_snapshot_template_url(self) -> None:
-		"""Update the cached snapshot template from this camera's event history."""
+		"""Find this camera's newest snapshot across all returned history events."""
 		history = TypeAdapter(EventHistoryResponse).validate_python(
 			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
 				"get",
@@ -179,22 +177,21 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 			)
 		)
 
-		newest_video: EventVideo | None = None
+		newest_snapshot: EventMediaLink | None = None
 		newest_timestamp = 0
 		camera_serials = self._camera_event_serials()
 		for event in history.events:
-			if event.sensorSerial not in camera_serials:
-				continue
-			if event.video is None or event.videoStartedBy is None:
-				continue
-			if not (video := event.video.get(event.videoStartedBy)):
-				continue
 			if (timestamp := event.eventTimestamp or 0) <= newest_timestamp:
 				continue
-			newest_video, newest_timestamp = video, timestamp
+			for camera_id, video in (event.video or {}).items():
+				if camera_id not in camera_serials:
+					continue
+				if snapshot := video.links.get("snapshot/jpg"):
+					newest_snapshot, newest_timestamp = snapshot, timestamp
+					break
 
-		if newest_video and (snapshot := newest_video.links.get("snapshot/jpg")):
-			self._snapshot_template_url = snapshot.href
+		if newest_snapshot:
+			self._snapshot_template_url = newest_snapshot.href
 
 	@override
 	@callback
@@ -229,6 +226,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
 				"get", f"cameras/{self._device.serial}/{self._system.system_id}/live-view",
 				url_base=WEBRTC_URL_BASE,
+				headers={"Host": "app-hub.prd.aser.simplisafe.com"},
 			)
 		)
 
@@ -275,8 +273,9 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 
 				session.start(on_close)
 				try:
-					await ice_servers_ready
-				except asyncio.CancelledError:
+					async with asyncio.timeout(15):
+						await ice_servers_ready
+				except (Exception, asyncio.CancelledError):
 					session.close()
 					raise
 			case "kvs":

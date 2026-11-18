@@ -1,60 +1,45 @@
 # SimpliRTC
 
-SimpliRTC adds native WebRTC support for SimpliSafe cameras in Home Assistant.
-
-SimpliRTC requires the native Home Assistant SimpliSafe integration to be set up,
-and adds camera support to the existing integration.
+SimpliRTC adds live camera viewing, snapshot images, and camera motion events
+to Home Assistant's SimpliSafe integration.
 
 ## Setup
 
-Install SimpliRTC either by adding this repository to HACS and installing the
-SimpliRTC integration, or by copying `custom_components/simplirtc` into your
-Home Assistant `custom_components` folder.
+1. Set up the built-in SimpliSafe integration in Home Assistant.
+2. Add this repository to HACS and install SimpliRTC, or copy
+   `custom_components/simplirtc` into your Home Assistant `custom_components`
+   folder.
+3. Add the following to your `configuration.yaml`:
 
-Add SimpliRTC to your `configuration.yaml`:
+   ```yaml
+   simplirtc:
+   ```
 
-```yaml
-simplirtc:
-```
+4. Restart Home Assistant.
 
-Add and configure the normal Home Assistant SimpliSafe integration.
+SimpliRTC automatically adds supported cameras from your SimpliSafe account.
 
-Once the SimpliSafe integration is loaded, SimpliRTC watches for its config
-entries and automatically adds camera support for supported cameras.
+## Camera features
 
-SimpliRTC also adds motion event entities for V3 cameras. These entities are
-backed by SimpliSafe websocket motion events, so they do not depend on the
-camera's WebRTC backend. SimpliSafe does not appear to expose a camera
-motion-active API state or a matching motion-clear event, so motion is exposed
-as an event rather than a latched on/off state.
+- **Live viewing:** Watch supported SimpliSafe cameras in Home Assistant.
+- **Snapshot images:** See the latest available image from the camera's event
+  history. An event triggered by another camera or sensor can also provide a
+  newer image for this camera. These images are event snapshots, so they may
+  not show the camera's current view.
+- **Motion events:** Use camera motion events in Home Assistant automations.
+  SimpliSafe does not provide a matching motion-clear event, so motion is
+  exposed as an event rather than an on/off sensor.
 
-## Supported Systems
+## Supported systems
 
-Only SimpliSafe V3 systems are supported. Older system versions are skipped.
+Only SimpliSafe V3 systems are supported.
 
-SimpliSafe uses different video backends for different accounts and systems.
-Some cameras use AWS Kinesis Video Streams, and some use LiveKit. SimpliRTC
-supports both of those backends.
+SimpliSafe uses different services for live video. SimpliRTC supports cameras
+using AWS Kinesis Video Streams or LiveKit. Cameras using other services are
+not added.
 
-Some reported systems use a different backend that SimpliRTC does not currently
-support. Cameras on unknown backends are intentionally ignored instead of being
-added as broken camera entities.
+Your account's video service is chosen by SimpliSafe and can change without a
+camera or base-station firmware update. SimpliRTC's author currently has
+LiveKit cameras and cannot directly test Kinesis cameras.
 
-Pull requests are welcome for adding support for other systems or video
-backends. I try to keep Kinesis support working, but I can no longer test it
-directly because my system now uses LiveKit.
-
-I do not know what causes SimpliSafe to choose a specific backend. It does not
-appear to be only camera or base-station firmware. For example, my system was
-originally on Kinesis and was later switched to LiveKit without changing the
-camera or base-station firmware.
-
-## Advanced: Backend Names
-
-The backend value comes from the camera admin settings as `webRTCProvider`.
-SimpliRTC currently recognizes these values:
-
-- `kvs`: AWS Kinesis Video Streams
-- `mist`: LiveKit
-
-Any other `webRTCProvider` value is treated as unknown and skipped.
+Contributions to support additional systems and cameras are welcome.

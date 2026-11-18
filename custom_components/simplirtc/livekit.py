@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 from collections.abc import (
 	AsyncGenerator,
 	AsyncIterator,
@@ -132,11 +133,16 @@ class LiveKitSignal:
 				headers={"Authorization": f"Bearer {token}"},
 			) as ws,
 		):
-			yield cls(
+			signal = cls(
 				ws=ws,
 				logger=logger,
 				task_group=task_group,
 			)
+			try:
+				yield signal
+			finally:
+				if signal._ping_task is not None:
+					signal._ping_task.cancel()
 
 	def __aiter__(self) -> AsyncIterator[LiveKitSignalMessage]:
 		"""Iterate over parsed LiveKit signaling messages."""
@@ -429,6 +435,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 		self._logger = _LOGGER.getChild(f"session.{self._id}")
 
 		self._offer_sdp: str | None = None
+		self._pending_answers: deque[bool] = deque()
 		self._reader_task: asyncio.Task[None] | None = None
 		self._request_queue = MessageQueue[SignalRequest]()
 
@@ -461,6 +468,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 			raise RuntimeError(f"LiveKit session {self._id} was not started")
 		self._send_message = send_message
 		self._offer_sdp = offer_sdp
+		self._pending_answers.append(True)
 		await self._request_queue.add(SignalRequest(offer=SessionDescription(
 			type="offer",
 			sdp=offer_sdp,
@@ -491,6 +499,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 	def close(self) -> None:
 		"""Stop this LiveKit signaling session."""
 		self._request_queue.clear()
+		self._pending_answers.clear()
 		if (reader_task := self._reader_task) is not None:
 			self._reader_task = None
 			reader_task.cancel()
@@ -589,7 +598,9 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 			raise RuntimeError("LiveKit websocket closed before join response")
 
 	def _on_answer(self, answer: SessionDescription) -> None:
-		if send_message := self._send_message:
+		if not self._pending_answers:
+			return
+		if self._pending_answers.popleft() and (send_message := self._send_message):
 			send_message(WebRTCAnswer(answer=answer.sdp))
 
 	def _on_trickle(self, trickle: TrickleRequest) -> None:
@@ -637,6 +648,7 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 		if self._offer_sdp is None:
 			self._logger.warning("LiveKit requested media sections before browser offer")
 			return
+		self._pending_answers.append(False)
 		await self._request_queue.add(SignalRequest(offer=SessionDescription(
 			type="offer",
 			sdp=self._offer_sdp,
