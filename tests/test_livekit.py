@@ -29,11 +29,13 @@ class FakeSignal:
     def __init__(self, messages):
         self.messages = messages
         self.sent = []
+        self.received = 0
 
     def __aiter__(self):
         async def iterate():
             for message in self.messages:
                 await asyncio.sleep(0)
+                self.received += 1
                 yield message
         return iterate()
 
@@ -87,15 +89,19 @@ async def test_conditional_warmup_and_browser_handoff(already_published):
 
 
 @pytest.mark.asyncio
-async def test_warmup_negotiates_late_audio_and_video_before_closing():
+@pytest.mark.parametrize('permissions_first', [False, True])
+async def test_warmup_negotiates_late_audio_and_video_before_closing(permissions_first):
     """The warmup peer applies answers and renegotiates until both permissions arrive."""
-    signal = FakeSignal([
-        ("answer", SessionDescription(type="answer", sdp="initial")),
-        ("update", ParticipantUpdate(participants=[tracks()])),
+    update = ("update", ParticipantUpdate(participants=[tracks()]))
+    permissions = [
         ("subscription_permission_update", SubscriptionPermissionUpdate(track_sid="audio", allowed=True)),
         ("media_sections_requirement", MediaSectionsRequirement()),
         ("answer", SessionDescription(type="answer", sdp="late")),
         ("subscription_permission_update", SubscriptionPermissionUpdate(track_sid="video", allowed=True)),
+    ]
+    signal = FakeSignal([
+        ("answer", SessionDescription(type="answer", sdp="initial")),
+        *([*permissions, update] if permissions_first else [update, *permissions]),
     ])
     peer = SimpleNamespace(
         addTransceiver=lambda *args, **kwargs: None,
@@ -237,3 +243,29 @@ async def test_microphone_rejection_is_reported_to_home_assistant():
     assert len(messages) == 1
     assert isinstance(messages[0], WebRTCError)
     assert messages[0].code == 'microphone_publish_failed'
+
+
+@pytest.mark.asyncio
+async def test_warmup_waits_after_permission_revocation_and_track_replacement():
+    replacement = tracks()
+    replacement.tracks[0].sid = 'replacement-audio'
+    signal = FakeSignal([
+        ('update', ParticipantUpdate(participants=[tracks()])),
+        ('subscription_permission_update', SubscriptionPermissionUpdate(track_sid='audio', allowed=True)),
+        ('subscription_permission_update', SubscriptionPermissionUpdate(track_sid='audio', allowed=False)),
+        ('subscription_permission_update', SubscriptionPermissionUpdate(track_sid='video', allowed=True)),
+        ('update', ParticipantUpdate(participants=[replacement])),
+        # A delayed permission for the old track must not complete warmup.
+        ('subscription_permission_update', SubscriptionPermissionUpdate(track_sid='audio', allowed=True)),
+        ('subscription_permission_update', SubscriptionPermissionUpdate(track_sid='replacement-audio', allowed=True)),
+    ])
+    peer = SimpleNamespace(
+        addTransceiver=lambda *args, **kwargs: None,
+        setLocalDescription=AsyncMock(), close=AsyncMock(),
+        localDescription=SimpleNamespace(type='offer', sdp='warmup offer'),
+    )
+    with patch('custom_components.simplirtc.livekit.RTCPeerConnection', return_value=peer):
+        async with WarmupSession(signal, ice_servers=[]) as warmup:
+            await warmup.run()
+    assert signal.received == len(signal.messages)
+    peer.close.assert_awaited_once()

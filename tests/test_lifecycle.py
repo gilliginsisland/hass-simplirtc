@@ -53,11 +53,11 @@ class Session(SimpliSafeWebRTCSession[str]):
 
     async def handle_offer(self, offer_sdp, send_message):
         self._accept_offer(send_message)
-        await self._request_queue.add(offer_sdp)
+        self._request_queue.put_nowait(offer_sdp)
 
     async def send_candidate(self, candidate):
         self._check_open()
-        await self._request_queue.add(candidate)
+        self._request_queue.put_nowait(candidate)
 
 
 async def closed(session):
@@ -127,7 +127,6 @@ async def test_remote_eof_or_writer_failure_closes_the_entire_scope(fail_send):
         session.disconnect.set()
     await closed(session)
     assert session.resources_closed
-    assert not session._request_queue.flushed
 
 
 @pytest.mark.asyncio
@@ -325,8 +324,8 @@ async def test_camera_ignores_late_candidates_while_session_is_closing():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('cancel_prepare', [False, True])
-async def test_camera_preparation_uses_managed_owner_and_handles_cancellation(cancel_prepare):
+@pytest.mark.parametrize('provider,cancel_prepare', [('mist', False), ('mist', True), ('kvs', False)])
+async def test_camera_preparation_uses_managed_owner_and_handles_cancellation(provider, cancel_prepare):
     camera = SimpliSafeCamera.__new__(SimpliSafeCamera)
     camera.hass = SimpleNamespace(loop=asyncio.get_running_loop())
     camera.entity_id = 'camera.test'
@@ -342,21 +341,22 @@ async def test_camera_preparation_uses_managed_owner_and_handles_cancellation(ca
         managed.append(task)
         return task
     camera._entry = SimpleNamespace(async_create_background_task=create_task)
+    servers = [SimpleNamespace(urls=['turn:example.test:3478'], username='test', credential='test')]
     camera._create_stream = AsyncMock(return_value=SimpleNamespace(liveKitDetails=SimpleNamespace(
         liveKitURL='ws://localhost', userToken='test',
-    )))
+    ), signedChannelEndpoint='ws://localhost', clientId='test', iceServers=servers))
     session = Session(delayed_cleanup=True)
     read = session._read
-    def factory(*args, send_ice_servers, **kwargs):
+    def factory(*args, send_ice_servers=None, **kwargs):
         async def receive():
-            if not cancel_prepare:
-                send_ice_servers([])
+            if send_ice_servers is not None and not cancel_prepare:
+                send_ice_servers(servers)
             await read()
         session._read = receive
         return session
-    with patch.object(SimpliSafeCamera, '_web_rtc_provider', new_callable=PropertyMock, return_value='mist'), patch(
+    with patch.object(SimpliSafeCamera, '_web_rtc_provider', new_callable=PropertyMock, return_value=provider), patch(
         'custom_components.simplirtc.camera.LiveKitSession', side_effect=factory,
-    ):
+    ), patch('custom_components.simplirtc.camera.KinesisSession', side_effect=factory):
         prepare = asyncio.create_task(camera.async_prepare_webrtc_client_configuration())
         await session.entered.wait()
         if cancel_prepare:
@@ -370,7 +370,11 @@ async def test_camera_preparation_uses_managed_owner_and_handles_cancellation(ca
             assert not camera._provider_sessions
             assert not camera._unused_sessions
         else:
-            await prepare
+            config = await prepare
+            assert len(config.configuration.ice_servers) == 1
+            assert config.configuration.ice_servers[0].urls == servers[0].urls
+            assert config.configuration.ice_servers[0].username == 'test'
+            assert config.configuration.ice_servers[0].credential == 'test'
             assert session in camera._unused_sessions
             assert managed == [session._task]
             # Claiming the prepared session disarms its scoped expiration.
