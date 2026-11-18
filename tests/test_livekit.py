@@ -179,3 +179,60 @@ async def test_internal_replay_answers_do_not_reach_stable_browser():
     client._on_answer(SessionDescription(sdp="new browser answer"))
     assert answers == [WebRTCAnswer(answer="initial answer"), WebRTCAnswer(answer="new browser answer")]
     assert not client._pending_answers
+
+
+def microphone_offer(direction='sendrecv', port=9, streams='*'):
+    return '\r\n'.join([
+        'v=0', 'o=- 0 0 IN IP4 127.0.0.1', 's=-', 't=0 0',
+        f'a=msid-semantic:WMS {streams}', f'm=audio {port} UDP/TLS/RTP/SAVPF 111',
+        'c=IN IP4 0.0.0.0', 'a=mid:0', f'a={direction}',
+        'a=msid:- browser-microphone', 'a=rtpmap:111 opus/48000/2', '',
+    ])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('streams', ['*', ''])
+async def test_microphone_is_registered_before_offer_and_not_duplicated(streams):
+    client = LiveKitSession(livekit_url='ws://localhost', user_token='test', send_ice_servers=lambda _: None)
+    client._task = SimpleNamespace(done=lambda: False)
+    signal = FakeSignal([])
+    offer = microphone_offer(streams=streams)
+    async with client._request_queue.sending(signal.send):
+        await client.handle_offer(offer, lambda _: None)
+        await client.handle_offer(offer, lambda _: None)
+        await asyncio.sleep(0)
+    assert [r.WhichOneof('message') for r in signal.sent] == ['add_track', 'offer', 'offer']
+    track = signal.sent[0].add_track
+    assert track.cid == 'browser-microphone'
+    assert track.type == AUDIO and track.source == MICROPHONE
+    assert all(r.offer.sdp == offer for r in signal.sent[1:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('direction,port', [('recvonly', 9), ('sendonly', 9), ('inactive', 9), ('sendrecv', 0)])
+async def test_listening_and_rejected_audio_sections_do_not_publish(direction, port):
+    client = LiveKitSession(livekit_url='ws://localhost', user_token='test', send_ice_servers=lambda _: None)
+    client._task = SimpleNamespace(done=lambda: False)
+    signal = FakeSignal([])
+    async with client._request_queue.sending(signal.send):
+        await client.handle_offer(microphone_offer(direction, port), lambda _: None)
+        await asyncio.sleep(0)
+    assert [r.WhichOneof('message') for r in signal.sent] == ['offer']
+
+
+@pytest.mark.asyncio
+async def test_microphone_rejection_is_reported_to_home_assistant():
+    from homeassistant.components.camera import WebRTCError
+    from custom_components.simplirtc.protobufs.livekit_rtc_pb2 import AddTrackRequest, RequestResponse, SignalResponse
+    client = LiveKitSession(livekit_url='ws://localhost', user_token='test', send_ice_servers=lambda _: None)
+    client._task = SimpleNamespace(done=lambda: False)
+    messages = []
+    await client.handle_offer(microphone_offer(), messages.append)
+    response = SignalResponse(request_response=RequestResponse(
+        reason=RequestResponse.NOT_ALLOWED,
+        add_track=AddTrackRequest(cid='browser-microphone'),
+    ))
+    await client._run_browser_signal(FakeSignal([('response', response)]))
+    assert len(messages) == 1
+    assert isinstance(messages[0], WebRTCError)
+    assert messages[0].code == 'microphone_publish_failed'
