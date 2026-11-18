@@ -70,33 +70,28 @@ class KinesisSession(SimpliSafeWebRTCSession[KinesisRequest]):
 		"""Handle a browser offer on the running Kinesis session."""
 		self._accept_offer(send_message)
 
-		offer_msg = KinesisRequest(
-			action="SDP_OFFER",
-			recipientClientId=self._client_id,
-			correlationId=f"{self._id}.{self._next_correlation_id()}",
-		)
-		offer_msg.payload = {"type": "offer", "sdp": offer_sdp}
-		self._request_queue.put_nowait(offer_msg)
+		self._queue_request("SDP_OFFER", {"type": "offer", "sdp": offer_sdp})
 
 	@override
 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
 		self._check_open()
-		candidate_msg = KinesisRequest(
-			action="ICE_CANDIDATE",
-			recipientClientId=self._client_id,
-			correlationId=f"{self._id}.{self._next_correlation_id()}",
-		)
-		candidate_msg.payload = {
+		self._queue_request("ICE_CANDIDATE", {
 			"candidate": candidate.candidate,
 			"sdpMid": candidate.sdp_mid,
 			"sdpMLineIndex": candidate.sdp_m_line_index,
 			"usernameFragment": None,
-		}
-		self._request_queue.put_nowait(candidate_msg)
+		})
 
-	def _next_correlation_id(self) -> int:
+	def _queue_request(self, action: str, payload: dict[str, Any]) -> None:
+		"""Wrap each payload in the same ordered Kinesis request envelope."""
 		self._message_count += 1
-		return self._message_count
+		request = KinesisRequest(
+			action=action,
+			recipientClientId=self._client_id,
+			correlationId=f"{self._id}.{self._message_count}",
+		)
+		request.payload = payload
+		self._request_queue.put_nowait(request)
 
 	async def _read(self) -> None:
 		async with (
