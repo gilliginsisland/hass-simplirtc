@@ -232,7 +232,8 @@ async def test_microphone_rejection_is_reported_to_home_assistant():
         reason=RequestResponse.NOT_ALLOWED,
         add_track=AddTrackRequest(cid='browser-microphone'),
     ))
-    await client._run_browser_signal(FakeSignal([('response', response)]))
+    decoded = LiveKitSignal._response_message(SimpleNamespace(), response)
+    await client._run_browser_signal(FakeSignal([decoded]))
     assert len(messages) == 1
     assert isinstance(messages[0], WebRTCError)
     assert messages[0].code == 'microphone_publish_failed'
