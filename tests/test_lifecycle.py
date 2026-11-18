@@ -388,3 +388,32 @@ async def test_camera_preparation_uses_managed_owner_and_handles_cancellation(pr
             await session.wait_closed()
             assert not camera._provider_sessions
             assert not camera._sessions
+
+
+@pytest.mark.asyncio
+async def test_kinesis_offer_and_candidate_keep_their_wire_payloads_and_order():
+    import base64
+    from dataclasses import asdict
+    import json
+    from webrtc_models import RTCIceCandidateInit
+
+    session = KinesisSession(channel_endpoint='ws://localhost/kinesis', client_id='camera-client')
+    session._task = SimpleNamespace(done=lambda: False)
+    requests = []
+    async def record(request):
+        requests.append(asdict(request))
+    candidate = RTCIceCandidateInit(candidate='candidate:1 1 UDP 1 192.0.2.1 1234 typ host',
+                                   sdp_mid='audio', sdp_m_line_index=0)
+    async with session._request_queue.sending(record):
+        await session.handle_offer('first offer', lambda _: None)
+        await session.send_candidate(candidate)
+        await session.handle_offer('second offer', lambda _: None)
+        await asyncio.sleep(0)
+    assert [r['action'] for r in requests] == ['SDP_OFFER', 'ICE_CANDIDATE', 'SDP_OFFER']
+    assert [r['recipientClientId'] for r in requests] == ['camera-client'] * 3
+    assert [r['correlationId'] for r in requests] == [f'{session._id}.{i}' for i in (1, 2, 3)]
+    assert [json.loads(base64.b64decode(r['messagePayload'])) for r in requests] == [
+        {'type': 'offer', 'sdp': 'first offer'},
+        {'candidate': candidate.candidate, 'sdpMid': 'audio', 'sdpMLineIndex': 0, 'usernameFragment': None},
+        {'type': 'offer', 'sdp': 'second offer'},
+    ]
