@@ -31,14 +31,14 @@ from homeassistant.components.camera import (
 )
 from webrtc_models import RTCIceCandidateInit
 
-from .vendor.aiortc import (
+from aiortc import (
 	RTCBundlePolicy,
 	RTCConfiguration,
 	RTCIceServer,
 	RTCPeerConnection,
 	RTCSessionDescription,
 )
-from .vendor.aiortc.sdp import candidate_from_sdp
+from aiortc.sdp import candidate_from_sdp
 from .protobufs.livekit_models_pb2 import (
 	AUDIO,
 	CAMERA,
