@@ -92,41 +92,44 @@ async def async_setup_entry(
 		if device_id in entities or (device is not None and source_account(device) is not None):
 			changes.put_nowait(device_id)
 
+	def matching_camera(device: dr.DeviceEntry | None) -> tuple[SimpliSafe, SystemV3, Camera] | None:
+		"""Find a supported camera in the device's owning account."""
+		if device is None or (account := source_account(device)) is None:
+			return None
+		for system in account.runtime_data.systems.values():
+			if not isinstance(system, SystemV3):
+				continue
+			for camera in system.cameras.values():
+				if (
+					(SIMPLISAFE_DOMAIN, camera.serial) in device.identifiers
+					and _camera_web_rtc_provider(camera) in {"mist", "kvs"}
+				):
+					return account.runtime_data, system, camera
+		return None
+
 	async def reconcile(device_id: str) -> None:
 		parent = registry.async_get(device_id)
-		match = None
-		if parent is not None and (account := source_account(parent)) is not None:
-			for system in account.runtime_data.systems.values():
-				if not isinstance(system, SystemV3):
-					continue
-				for camera in system.cameras.values():
-					if (SIMPLISAFE_DOMAIN, camera.serial) in parent.identifiers:
-						if _camera_web_rtc_provider(camera) in {"mist", "kvs"}:
-							match = (account.runtime_data, system, camera)
-						break
-				if match is not None:
-					break
-
+		match = matching_camera(parent)
 		existing = entities.get(device_id)
-		if existing is not None and (
-			match is None
-			or existing._device.serial != match[2].serial
-			or existing._simplisafe is not match[0]
-		):
-			if entity := entities.pop(device_id, None):
-				# Addition may still be in flight when a removal arrives. The event
-				# also completes if HA aborts addition (for example, a disabled entity).
-				await entity._platform_ready.wait()
-				if entity._added_to_hass:
-					await entity.async_remove()
-		if match is None:
+		if existing is not None and match is not None:
+			simplisafe, _, camera = match
+			if existing._device.serial == camera.serial and existing._simplisafe is simplisafe:
+				return
+
+		if existing is not None:
+			del entities[device_id]
+			# Addition may still be in flight when a removal arrives. The event
+			# also completes if HA aborts addition (for example, a disabled entity).
+			await existing._platform_ready.wait()
+			if existing._added_to_hass:
+				await existing.async_remove()
+
+		if match is None or not accepting_changes():
 			return
-		if device_id not in entities and accepting_changes():
-			simplisafe, system, camera = match
-			entity = entities[device_id] = SimpliSafeCamera(
-				simplisafe, system, camera, entry, parent,
-			)
-			async_add_entities([entity])
+		simplisafe, system, camera = match
+		entity = SimpliSafeCamera(simplisafe, system, camera, entry, parent)
+		entities[device_id] = entity
+		async_add_entities([entity])
 
 	async def watch_devices() -> None:
 		# Subscribe before the initial scan so late registrations cannot be missed.

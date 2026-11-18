@@ -172,11 +172,10 @@ class SimpliSafeWebRTCSession(ABC, Generic[_MessageT]):
 		if self._close_requested:
 			return
 		self._close_requested = True
-		if self._task is not None:
-			if not self._task.cancelling():
-				self._task.cancel()
-		else:
+		if self._task is None:
 			self._closed.set()
+		elif not self._task.cancelling():
+			self._task.cancel()
 
 	async def wait_closed(self) -> None:
 		"""Wait for cleanup without propagating caller cancellation to the owner."""

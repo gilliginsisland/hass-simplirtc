@@ -34,12 +34,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 def _migrate_devices(hass: HomeAssistant, entry: ConfigEntry) -> None:
 	"""Relink devices from the original, per-account integration."""
-	if parent_id := entry.data.get(ATTR_CONFIG_ENTRY_ID):
-		registry = dr.async_get(hass)
-		for device in dr.async_entries_for_config_entry(registry, parent_id):
-			async_remove_helper_devices(
-				hass, helper_config_entry_id=entry.entry_id, source_device_id=device.id,
-			)
+	if not (parent_id := entry.data.get(ATTR_CONFIG_ENTRY_ID)):
+		return
+	registry = dr.async_get(hass)
+	for device in dr.async_entries_for_config_entry(registry, parent_id):
+		async_remove_helper_devices(
+			hass, helper_config_entry_id=entry.entry_id, source_device_id=device.id,
+		)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
