@@ -1,60 +1,49 @@
 # SimpliRTC
 
-SimpliRTC adds native WebRTC support for SimpliSafe cameras in Home Assistant.
-
-SimpliRTC requires the native Home Assistant SimpliSafe integration to be set up,
-and adds camera support to the existing integration.
+SimpliRTC adds live camera viewing and snapshot images to the camera devices
+provided by Home Assistant's built-in SimpliSafe integration.
 
 ## Setup
 
-Install SimpliRTC either by adding this repository to HACS and installing the
-SimpliRTC integration, or by copying `custom_components/simplirtc` into your
-Home Assistant `custom_components` folder.
+1. Set up the built-in SimpliSafe integration in Home Assistant.
+2. Install SimpliRTC through Marketplace, or copy
+   `custom_components/simplirtc` into your Home Assistant `custom_components`
+   folder, then restart Home Assistant.
+3. Go to **Settings → Devices & services → Add integration** and select
+   **Simplisafe WebRTC Cameras**.
 
-Add SimpliRTC to your `configuration.yaml`:
+Set up SimpliRTC once. It automatically adds live-view entities to supported
+cameras across all your built-in SimpliSafe accounts, including accounts and
+cameras you add later. Entities appear on the existing SimpliSafe devices.
 
-```yaml
-simplirtc:
-```
+Existing installations are upgraded automatically and keep their entity IDs.
+If you previously added `simplirtc:` to `configuration.yaml`, you can remove it;
+configuration is now managed in the UI.
 
-Add and configure the normal Home Assistant SimpliSafe integration.
+## Camera features
 
-Once the SimpliSafe integration is loaded, SimpliRTC watches for its config
-entries and automatically adds camera support for supported cameras.
+- **Live viewing:** Watch supported SimpliSafe cameras in Home Assistant.
+- **Snapshot images:** See the latest available image from the camera's event
+  history. An event triggered by another camera or sensor can also provide a
+  newer image for this camera. These images are event snapshots, so they may
+  not show the camera's current view.
 
-SimpliRTC also adds motion event entities for V3 cameras. These entities are
-backed by SimpliSafe websocket motion events, so they do not depend on the
-camera's WebRTC backend. SimpliSafe does not appear to expose a camera
-motion-active API state or a matching motion-clear event, so motion is exposed
-as an event rather than a latched on/off state.
+Camera motion and doorbell events are provided by Home Assistant's built-in
+SimpliSafe integration. SimpliRTC does not add duplicate event entities.
+If an existing automation uses a SimpliRTC motion event, select the built-in
+SimpliSafe motion event entity instead.
 
-## Supported Systems
+## Supported systems
 
-Only SimpliSafe V3 systems are supported. Older system versions are skipped.
+Only SimpliSafe V3 systems are supported.
 
-SimpliSafe uses different video backends for different accounts and systems.
-Some cameras use AWS Kinesis Video Streams, and some use LiveKit. SimpliRTC
-supports both of those backends.
+SimpliSafe uses different services for live video. SimpliRTC supports live
+viewing through AWS Kinesis Video Streams or LiveKit. Cameras using other
+services do not get a SimpliRTC live-view entity. Their devices and motion
+events remain available through the built-in SimpliSafe integration.
 
-Some reported systems use a different backend that SimpliRTC does not currently
-support. Cameras on unknown backends are intentionally ignored instead of being
-added as broken camera entities.
+Your account's video service is chosen by SimpliSafe and can change without a
+camera or base-station firmware update. SimpliRTC's author currently has
+LiveKit cameras and cannot directly test Kinesis cameras.
 
-Pull requests are welcome for adding support for other systems or video
-backends. I try to keep Kinesis support working, but I can no longer test it
-directly because my system now uses LiveKit.
-
-I do not know what causes SimpliSafe to choose a specific backend. It does not
-appear to be only camera or base-station firmware. For example, my system was
-originally on Kinesis and was later switched to LiveKit without changing the
-camera or base-station firmware.
-
-## Advanced: Backend Names
-
-The backend value comes from the camera admin settings as `webRTCProvider`.
-SimpliRTC currently recognizes these values:
-
-- `kvs`: AWS Kinesis Video Streams
-- `mist`: LiveKit
-
-Any other `webRTCProvider` value is treated as unknown and skipped.
+Contributions to support additional systems and cameras are welcome.

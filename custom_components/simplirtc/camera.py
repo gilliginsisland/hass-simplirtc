@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-import functools
 import logging
 from typing import TypeVar, override
 
@@ -21,18 +20,21 @@ from webrtc_models import (
 	RTCIceServer,
 )
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.components.camera import (
 	Camera as CameraEntity,
+	CameraEntityCapabilities,
 	CameraEntityFeature,
 	CameraEntityDescription,
 	WebRTCClientConfiguration,  # pyright: ignore[reportPrivateImportUsage]
 	WebRTCSendMessage,  # pyright: ignore[reportPrivateImportUsage]
 )
 from homeassistant.components.simplisafe import SimpliSafe
+from homeassistant.components.simplisafe.const import DOMAIN as SIMPLISAFE_DOMAIN
 from homeassistant.components.simplisafe.entity import SimpliSafeEntity
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .kinesis import KinesisSession
@@ -49,25 +51,101 @@ UNUSED_WEBRTC_SESSION_TTL = 30
 _StreamResponseT = TypeVar("_StreamResponseT")
 
 
+def _camera_web_rtc_provider(camera: Camera) -> str | None:
+	"""Read the camera's advertised live-view backend."""
+	if not isinstance(settings := camera.camera_settings.get("admin"), Mapping):
+		return None
+	if provider := settings.get("webRTCProvider"):
+		return str(provider)
+	return None
+
+
 async def async_setup_entry(
-	hass: HomeAssistant,  # pyright: ignore[reportUnusedParameter]
-	entry: ConfigEntry[SimpliSafe],
+	hass: HomeAssistant,
+	entry: ConfigEntry,
 	async_add_entities: AddEntitiesCallback,
 ) -> None:
-	"""Set up a SimpliSafe Camera."""
-	simplisafe = entry.runtime_data
+	"""Follow registered camera devices across all core SimpliSafe accounts."""
+	registry = dr.async_get(hass)
+	entities: dict[str, SimpliSafeCamera] = {}
+	changes: asyncio.Queue[str] = asyncio.Queue()
 
-	cameras: list[SimpliSafeCamera] = []
+	def accepting_changes() -> bool:
+		return entry.state in {ConfigEntryState.SETUP_IN_PROGRESS, ConfigEntryState.LOADED}
 
-	for system in simplisafe.systems.values():
-		if not isinstance(system, SystemV3):
-			_LOGGER.warning("Skipping camera setup for V%d system: %s", system.version, system.system_id)
-			continue
+	def source_account(device: dr.DeviceEntry) -> ConfigEntry[SimpliSafe] | None:
+		parent = hass.config_entries.async_get_entry(device.config_entry_id)
+		if parent is None or parent.domain != SIMPLISAFE_DOMAIN or parent.disabled_by:
+			return None
+		# Core registers devices while setting up its entity platforms, after
+		# assigning runtime_data. Do not wait for its LOADED notification.
+		if parent.state not in {ConfigEntryState.SETUP_IN_PROGRESS, ConfigEntryState.LOADED}:
+			return None
+		return parent if hasattr(parent, "runtime_data") else None
 
-		for camera in system.cameras.values():
-			cameras.append(SimpliSafeCamera(simplisafe, system, camera))
+	@callback
+	def device_changed(event: Event[dr.EventDeviceRegistryUpdatedData]) -> None:
+		if not accepting_changes():
+			return
+		device_id = event.data["device_id"]
+		device = registry.async_get(device_id)
+		if device_id in entities or (device is not None and source_account(device) is not None):
+			changes.put_nowait(device_id)
 
-	async_add_entities(cameras)
+	async def reconcile(device_id: str) -> None:
+		parent = registry.async_get(device_id)
+		match = None
+		if parent is not None and (account := source_account(parent)) is not None:
+			for system in account.runtime_data.systems.values():
+				if not isinstance(system, SystemV3):
+					continue
+				for camera in system.cameras.values():
+					if (SIMPLISAFE_DOMAIN, camera.serial) in parent.identifiers:
+						if _camera_web_rtc_provider(camera) in {"mist", "kvs"}:
+							match = (account.runtime_data, system, camera)
+						break
+				if match is not None:
+					break
+
+		existing = entities.get(device_id)
+		if existing is not None and (
+			match is None
+			or existing._device.serial != match[2].serial
+			or existing._simplisafe is not match[0]
+		):
+			if entity := entities.pop(device_id, None):
+				# Addition may still be in flight when a removal arrives. The event
+				# also completes if HA aborts addition (for example, a disabled entity).
+				await entity._platform_ready.wait()
+				if entity._added_to_hass:
+					await entity.async_remove()
+		if match is None:
+			return
+		if device_id not in entities and accepting_changes():
+			simplisafe, system, camera = match
+			entity = entities[device_id] = SimpliSafeCamera(
+				simplisafe, system, camera, entry, parent,
+			)
+			async_add_entities([entity])
+
+	async def watch_devices() -> None:
+		# Subscribe before the initial scan so late registrations cannot be missed.
+		unsubscribe = hass.bus.async_listen(dr.EVENT_DEVICE_REGISTRY_UPDATED, device_changed)
+		try:
+			for device in registry.devices:
+				changes.put_nowait(device.id)
+			while True:
+				device_id = await changes.get()
+				if not accepting_changes():
+					return
+				try:
+					await reconcile(device_id)
+				except Exception:
+					_LOGGER.exception("Updating a live-view entity after a device change failed")
+		finally:
+			unsubscribe()
+
+	entry.async_create_background_task(hass, watch_devices(), "simplirtc-camera-devices")
 
 
 @dataclass(kw_only=True, slots=True)
@@ -102,15 +180,13 @@ class EventMediaLink:
 
 @dataclass(kw_only=True, slots=True)
 class EventVideo:
-	links: dict[str, EventMediaLink] = Field(alias="_links")
+	links: dict[str, EventMediaLink] = Field(default_factory=dict, alias="_links")
 
 
 @dataclass(kw_only=True, slots=True)
 class EventHistoryEvent:
 	eventTimestamp: int | float | None = None
-	sensorSerial: str | None = None
 	video: dict[str, EventVideo] | None = None
-	videoStartedBy: str | None = None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -125,11 +201,15 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 ):
 	"""An implementation of a Simplisafe camera."""
 
+	_attr_camera_entity_capabilities = CameraEntityCapabilities(two_way_audio=True)
+
 	def __init__(
 		self,
 		simplisafe: SimpliSafe,
 		system: SystemV3,
 		device: Camera,
+		entry: ConfigEntry,
+		parent_device: dr.DeviceEntry,
 	) -> None:
 		"""Initialize the SimpliSafe camera."""
 		super().__init__(
@@ -141,13 +221,20 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		)
 		CameraEntity.__init__(self)
 
+		# Like Switch as X, link to the source integration's existing device.
+		self._attr_device_info = None
+		self.device_entry = parent_device
 		self._attr_unique_id = f"{super().unique_id}-camera"
 		self._attr_supported_features |= CameraEntityFeature.STREAM
 		self._device: Camera
 		self._sessions: dict[str, SimpliSafeWebRTCSession] = {}
-		self._unused_session_expirations: dict[
-			SimpliSafeWebRTCSession, asyncio.TimerHandle
-		] = {}
+		self._entry = entry
+		self._unused_sessions: dict[SimpliSafeWebRTCSession, None] = {}
+		self._provider_sessions: set[SimpliSafeWebRTCSession] = set()
+		self._removing = False
+		self._added_to_hass = False
+		self._platform_ready = asyncio.Event()
+		self.async_on_remove(self._platform_ready.set)
 		self._snapshot_template_url: str | None = None
 
 	@override
@@ -171,7 +258,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		return None
 
 	async def _async_refresh_snapshot_template_url(self) -> None:
-		"""Update the cached snapshot template from this camera's event history."""
+		"""Find this camera's newest snapshot across all returned history events."""
 		history = TypeAdapter(EventHistoryResponse).validate_python(
 			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
 				"get",
@@ -179,22 +266,21 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 			)
 		)
 
-		newest_video: EventVideo | None = None
+		newest_snapshot: EventMediaLink | None = None
 		newest_timestamp = 0
 		camera_serials = self._camera_event_serials()
 		for event in history.events:
-			if event.sensorSerial not in camera_serials:
-				continue
-			if event.video is None or event.videoStartedBy is None:
-				continue
-			if not (video := event.video.get(event.videoStartedBy)):
-				continue
 			if (timestamp := event.eventTimestamp or 0) <= newest_timestamp:
 				continue
-			newest_video, newest_timestamp = video, timestamp
+			for camera_id, video in (event.video or {}).items():
+				if camera_id not in camera_serials:
+					continue
+				if snapshot := video.links.get("snapshot/jpg"):
+					newest_snapshot, newest_timestamp = snapshot, timestamp
+					break
 
-		if newest_video and (snapshot := newest_video.links.get("snapshot/jpg")):
-			self._snapshot_template_url = snapshot.href
+		if newest_snapshot:
+			self._snapshot_template_url = newest_snapshot.href
 
 	@override
 	@callback
@@ -229,71 +315,101 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 			await self._simplisafe._api.async_request(  # pyright: ignore[reportPrivateUsage]
 				"get", f"cameras/{self._device.serial}/{self._system.system_id}/live-view",
 				url_base=WEBRTC_URL_BASE,
+				headers={"Host": "app-hub.prd.aser.simplisafe.com"},
 			)
 		)
 
 	@property
 	def _web_rtc_provider(self) -> str | None:
-		if not isinstance(settings := self._device.camera_settings.get("admin"), Mapping):
-			return None
-		if provider := settings.get("webRTCProvider"):  # pyright: ignore[reportUnknownMemberType]
-			return str(provider)
+		return _camera_web_rtc_provider(self._device)
 
 	@property
 	def extra_state_attributes(self) -> dict[str, str | None]:
 		"""Return camera-specific state attributes."""
 		return {"webrtc_provider": self._web_rtc_provider}
 
+	@override
+	async def async_added_to_hass(self) -> None:
+		"""Complete device attachment before processing queued removal events."""
+		await super().async_added_to_hass()
+		self._added_to_hass = True
+		self._platform_ready.set()
+
+	@override
+	async def async_will_remove_from_hass(self) -> None:
+		"""Stop accepting sessions and await all their connection scopes."""
+		self._removing = True
+		self._added_to_hass = False
+		sessions = tuple(self._provider_sessions)
+		for session in sessions:
+			session.close()
+		await asyncio.gather(*(session.wait_closed() for session in sessions))
+		await super().async_will_remove_from_hass()
+
 	async def async_prepare_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
-		"""Create an unused provider session and return its client configuration."""
+		"""Start a scoped provider session and wait for its ICE configuration."""
+		if self._removing:
+			raise HomeAssistantError("Camera is being removed")
 		ice_servers: list[KinesisIceServer | LiveKitIceServer] = []
+		ice_servers_ready: asyncio.Future[None] = self.hass.loop.create_future()
+
+		def send_ice_servers(servers: list[LiveKitIceServer]) -> None:
+			ice_servers.extend(servers)
+			if not ice_servers_ready.done():
+				ice_servers_ready.set_result(None)
+
 		match self._web_rtc_provider:
 			case "mist":
 				live_view = await self._create_stream(LiveKitResponse)
-				ice_servers_ready: asyncio.Future[None] = self.hass.loop.create_future()
-
-				def send_ice_servers(servers: list[LiveKitIceServer]) -> None:
-					ice_servers.extend(servers)
-					if not ice_servers_ready.done():
-						ice_servers_ready.set_result(None)
-
-				def close_before_ice_servers() -> None:
-					if not ice_servers_ready.done():
-						ice_servers_ready.set_exception(HomeAssistantError(
-							f"LiveKit session closed before ICE servers were received for {self.entity_id}"
-						))
-
 				session = LiveKitSession(
 					livekit_url=live_view.liveKitDetails.liveKitURL,
 					user_token=live_view.liveKitDetails.userToken,
 					send_ice_servers=send_ice_servers,
 				)
-
-				def on_close() -> None:
-					close_before_ice_servers()
-					self._expire(session)
-
-				session.start(on_close)
-				try:
-					await ice_servers_ready
-				except asyncio.CancelledError:
-					session.close()
-					raise
 			case "kvs":
 				live_view = await self._create_stream(KenisisResponse)
 				ice_servers.extend(live_view.iceServers)
+				ice_servers_ready.set_result(None)
 				session = KinesisSession(
 					channel_endpoint=live_view.signedChannelEndpoint,
 					client_id=live_view.clientId,
 				)
-				session.start(functools.partial(self._expire, session))
 			case _ as provider:
 				raise HomeAssistantError(
 					f"Camera {self.name} has unknown webrtc provider {provider!r}"
 				)
 
-		self._pool_unused_webrtc_session(session)
+		# Removal can happen while the live-view API request is in flight.
+		if self._removing:
+			raise HomeAssistantError("Camera is being removed")
 
+		def on_close() -> None:
+			self._session_closed(session)
+			if not ice_servers_ready.done():
+				ice_servers_ready.set_exception(HomeAssistantError(
+					f"Session closed before ICE configuration for {self.entity_id}"
+				))
+
+		self._provider_sessions.add(session)
+		try:
+			session.start(
+				on_close,
+				create_task=lambda coro, *, name: self._entry.async_create_background_task(
+					self.hass, coro, name, eager_start=False,
+				),
+				unused_timeout=UNUSED_WEBRTC_SESSION_TTL,
+			)
+			async with asyncio.timeout(15):
+				await ice_servers_ready
+		except (Exception, asyncio.CancelledError):
+			session.close()
+			await session.wait_closed()
+			self._provider_sessions.discard(session)
+			raise
+
+		if session not in self._provider_sessions or session.closing:
+			raise HomeAssistantError("Session closed while preparing configuration")
+		self._unused_sessions[session] = None
 		config = WebRTCClientConfiguration()
 		config.configuration.ice_servers.extend(
 			RTCIceServer(
@@ -303,7 +419,6 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 			)
 			for ice_server in ice_servers
 		)
-
 		return config
 
 	@override
@@ -312,20 +427,19 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 	) -> None:
 		"""Handle a WebRTC offer."""
 		if not (session := self._sessions.get(session_id)):
-			if (session := next(iter(self._unused_session_expirations), None)) is None:
+			if (session := next(iter(self._unused_sessions), None)) is None:
 				raise HomeAssistantError(f"No prepared WebRTC session for {self.entity_id}")
 
-			expiration = self._unused_session_expirations.pop(session)
-			expiration.cancel()
+			self._unused_sessions.pop(session)
 			_LOGGER.debug("Using pooled WebRTC session for %s", self.entity_id)
 			self._sessions[session_id] = session
 		else:
 			_LOGGER.debug("Renegotiating WebRTC session for %s", self.entity_id)
 		try:
 			await session.handle_offer(offer_sdp, send_message)
-		except Exception:
-			self._sessions.pop(session_id, None)
+		except (Exception, asyncio.CancelledError):
 			session.close()
+			await session.wait_closed()
 			raise
 
 	@override
@@ -333,7 +447,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		self, session_id: str, candidate: RTCIceCandidateInit
 	) -> None:
 		"""Handle a WebRTC candidate."""
-		if (session := self._sessions.get(session_id)):
+		if (session := self._sessions.get(session_id)) and not session.closing:
 			await session.send_candidate(candidate)
 		else:
 			_LOGGER.debug("Ignoring WebRTC candidate for closed session %s", session_id)
@@ -342,21 +456,14 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 	@callback
 	def close_webrtc_session(self, session_id: str) -> None:
 		"""Close a WebRTC session."""
-		if (session := self._sessions.pop(session_id, None)):
+		if session := self._sessions.get(session_id):
 			session.close()
 
 	@callback
-	def _pool_unused_webrtc_session(
-		self,
-		session: SimpliSafeWebRTCSession,
-	) -> None:
-		"""Pool a session prepared by a client config request."""
-		self._unused_session_expirations[session] = self.hass.loop.call_later(
-			UNUSED_WEBRTC_SESSION_TTL, self._expire, session,
-		)
-
-	@callback
-	def _expire(self, session: SimpliSafeWebRTCSession) -> None:
-		"""Close an unused prepared session if the offer never arrives."""
-		if self._unused_session_expirations.pop(session, None) is not None:
-			session.close()
+	def _session_closed(self, session: SimpliSafeWebRTCSession) -> None:
+		"""Remove routing entries only after the provider has finished cleanup."""
+		self._provider_sessions.discard(session)
+		self._unused_sessions.pop(session, None)
+		for session_id, active in tuple(self._sessions.items()):
+			if active is session:
+				del self._sessions[session_id]

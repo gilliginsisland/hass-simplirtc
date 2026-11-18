@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 from abc import ABC
-import asyncio
 import base64
-from collections.abc import Callable
 from dataclasses import asdict
 import json
 import logging
 from secrets import token_hex
 from typing import Any, override
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientWebSocketResponse
 from homeassistant.components.camera import (
 	WebRTCAnswer,  # pyright: ignore[reportPrivateImportUsage]
 	WebRTCCandidate,  # pyright: ignore[reportPrivateImportUsage]
@@ -22,11 +20,9 @@ from pydantic import TypeAdapter
 from pydantic.dataclasses import dataclass
 from webrtc_models import RTCIceCandidateInit
 
-from .webrtc import MessageQueue, SimpliSafeWebRTCSession
+from .webrtc import SimpliSafeWebRTCSession
 
 _LOGGER = logging.getLogger(__name__)
-
-SessionClosedCallback = Callable[[], None]
 
 
 @dataclass(kw_only=True, slots=True, config={"extra": "ignore"})
@@ -57,7 +53,7 @@ class KinesisResponse(KinesisMessage):
 	statusResponse: Any = None
 
 
-class KinesisSession(SimpliSafeWebRTCSession):
+class KinesisSession(SimpliSafeWebRTCSession[KinesisRequest]):
 	def __init__(
 		self,
 		*,
@@ -67,42 +63,13 @@ class KinesisSession(SimpliSafeWebRTCSession):
 		self._channel_endpoint = channel_endpoint
 		self._client_id = client_id
 		self._id = token_hex(4)
-		self._request_queue = MessageQueue[KinesisRequest]()
-		self._logger = _LOGGER.getChild(f"session.{self._id}")
+		super().__init__(logger=_LOGGER.getChild(f"session.{self._id}"), name=f"simplirtc-kinesis-{self._id}")
 		self._message_count = 0
-
-		self._send_message: WebRTCSendMessage | None = None
-		self._on_close: SessionClosedCallback | None = None
-		self._reader_task: asyncio.Task[None] | None = None
-
-	@override
-	def start(self, on_close: SessionClosedCallback) -> None:
-		"""Start Kinesis signaling in the background."""
-		if self._reader_task is not None:
-			raise RuntimeError(f"Kinesis session {self._id} already started")
-
-		self._on_close = on_close
-
-		async def reader_task() -> None:
-			try:
-				await self._read()
-			except Exception as err:
-				self._logger.error("Error in Kinesis session: %s", err)
-			finally:
-				self._reader_task = None
-				self.close()
-
-		self._reader_task = asyncio.create_task(
-			reader_task(), name=f"simplirtc-kinesis-{self._id}"
-		)
 
 	@override
 	async def handle_offer(self, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
 		"""Handle a browser offer on the running Kinesis session."""
-		if self._reader_task is None:
-			raise RuntimeError(f"Kinesis session {self._id} was not started")
-
-		self._send_message = send_message
+		self._accept_offer(send_message)
 
 		offer_msg = KinesisRequest(
 			action="SDP_OFFER",
@@ -114,6 +81,7 @@ class KinesisSession(SimpliSafeWebRTCSession):
 
 	@override
 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
+		self._check_open()
 		candidate_msg = KinesisRequest(
 			action="ICE_CANDIDATE",
 			recipientClientId=self._client_id,
@@ -126,16 +94,6 @@ class KinesisSession(SimpliSafeWebRTCSession):
 			"usernameFragment": None,
 		}
 		await self._request_queue.add(candidate_msg)
-
-	@override
-	def close(self) -> None:
-		if (task := self._reader_task) is not None:
-			self._reader_task = None
-			task.cancel()
-		self._request_queue.clear()
-		if on_close := self._on_close:
-			self._on_close = None
-			on_close()
 
 	def _next_correlation_id(self) -> int:
 		self._message_count += 1
@@ -150,30 +108,33 @@ class KinesisSession(SimpliSafeWebRTCSession):
 				self._logger.debug("-> %s", request)
 				await ws.send_json(asdict(request))
 
-			await self._request_queue.flush(send_request)
-			async for msg in ws:
-				self._logger.debug("<- %s", msg.data)
+			async with self._request_queue.sending(send_request):
+				await self._receive(ws)
 
-				if msg.data == "":
-					continue  # Ignore empty messages
+	async def _receive(self, ws: ClientWebSocketResponse) -> None:
+		async for msg in ws:
+			self._logger.debug("<- %s", msg.data)
 
-				try:
-					parsed = TypeAdapter(KinesisResponse).validate_json(msg.data)
-				except Exception:
-					self._logger.exception("failed to parse message")
+			if msg.data == "":
+				continue  # Ignore empty messages
+
+			try:
+				parsed = TypeAdapter(KinesisResponse).validate_json(msg.data)
+			except Exception:
+				self._logger.exception("failed to parse message")
+				continue
+
+			payload = parsed.payload
+			if not (send_message := self._send_message):
+				continue
+			match parsed.messageType:
+				case "SDP_ANSWER":
+					send_message(WebRTCAnswer(answer=payload["sdp"]))
+				case "ICE_CANDIDATE":
+					send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
+						candidate=payload.get("candidate", ""),
+						sdp_mid=payload.get("sdpMid"),
+						sdp_m_line_index=payload.get("sdpMLineIndex"),
+					)))
+				case _:
 					continue
-
-				payload = parsed.payload
-				if not (send_message := self._send_message):
-					continue
-				match parsed.messageType:
-					case "SDP_ANSWER":
-						send_message(WebRTCAnswer(answer=payload["sdp"]))
-					case "ICE_CANDIDATE":
-						send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
-							candidate=payload.get("candidate", ""),
-							sdp_mid=payload.get("sdpMid"),
-							sdp_m_line_index=payload.get("sdpMLineIndex"),
-						)))
-					case _:
-						continue

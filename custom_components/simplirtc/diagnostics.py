@@ -9,7 +9,6 @@ from simplipy.device.camera import Camera
 from simplipy.system.v3 import SystemV3
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.components.simplisafe import SimpliSafe
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
@@ -22,16 +21,15 @@ TO_REDACT = {
 
 
 async def async_get_config_entry_diagnostics(
-	hass: HomeAssistant, entry: ConfigEntry[SimpliSafe]
+	hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
 	"""Return diagnostics for a config entry."""
-	_ = hass
-	simplisafe = entry.runtime_data
 	data: dict[str, Any] = {
 		"entry": async_redact_data(entry.as_dict(), TO_REDACT),
 		"systems": [
 			_describe_system(system, index)
-			for index, system in enumerate(simplisafe.systems.values())
+			for account in hass.config_entries.async_loaded_entries("simplisafe")
+			for index, system in enumerate(account.runtime_data.systems.values())
 		],
 	}
 	return data

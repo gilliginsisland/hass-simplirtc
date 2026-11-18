@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up SimpliRTC",
+        "description": "Add live viewing and snapshots to supported cameras from all your Home Assistant SimpliSafe accounts. Set up the built-in SimpliSafe integration first."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "SimpliRTC is already configured. It covers all your SimpliSafe accounts."
+    }
+  }
+}
