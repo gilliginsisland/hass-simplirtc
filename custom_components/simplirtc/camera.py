@@ -48,6 +48,15 @@ UNUSED_WEBRTC_SESSION_TTL = 30
 _StreamResponseT = TypeVar("_StreamResponseT")
 
 
+def _camera_web_rtc_provider(camera: Camera) -> str | None:
+	"""Read the camera's advertised live-view backend."""
+	if not isinstance(settings := camera.camera_settings.get("admin"), Mapping):
+		return None
+	if provider := settings.get("webRTCProvider"):
+		return str(provider)
+	return None
+
+
 async def async_setup_entry(
 	hass: HomeAssistant,  # pyright: ignore[reportUnusedParameter]
 	entry: ConfigEntry[SimpliSafe],
@@ -64,6 +73,9 @@ async def async_setup_entry(
 			continue
 
 		for camera in system.cameras.values():
+			if (provider := _camera_web_rtc_provider(camera)) not in {"mist", "kvs"}:
+				_LOGGER.debug("Skipping live-view entity for unsupported WebRTC provider %r", provider)
+				continue
 			cameras.append(SimpliSafeCamera(simplisafe, system, camera, entry))
 
 	async_add_entities(cameras)
@@ -233,10 +245,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 
 	@property
 	def _web_rtc_provider(self) -> str | None:
-		if not isinstance(settings := self._device.camera_settings.get("admin"), Mapping):
-			return None
-		if provider := settings.get("webRTCProvider"):  # pyright: ignore[reportUnknownMemberType]
-			return str(provider)
+		return _camera_web_rtc_provider(self._device)
 
 	@property
 	def extra_state_attributes(self) -> dict[str, str | None]:

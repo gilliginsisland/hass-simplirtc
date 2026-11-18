@@ -34,9 +34,10 @@ SimpliRTC automatically adds supported cameras from your SimpliSafe account.
 
 Only SimpliSafe V3 systems are supported.
 
-SimpliSafe uses different services for live video. SimpliRTC supports cameras
-using AWS Kinesis Video Streams or LiveKit. Cameras using other services are
-not added.
+SimpliSafe uses different services for live video. SimpliRTC supports live
+viewing through AWS Kinesis Video Streams or LiveKit. Cameras using other
+services do not get a live-view entity, but can still appear as devices with
+motion events.
 
 Your account's video service is chosen by SimpliSafe and can change without a
 camera or base-station firmware update. SimpliRTC's author currently has
