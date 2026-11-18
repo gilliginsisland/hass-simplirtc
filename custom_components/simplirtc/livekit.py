@@ -66,6 +66,7 @@ from .protobufs.livekit_rtc_pb2 import (
 	SignalTarget,
 	SubscriptionPermissionUpdate,
 	SubscriptionResponse,
+	TrackPublishedResponse,
 	TrickleRequest,
 	WrappedJoinRequest,
 )
@@ -92,6 +93,8 @@ LiveKitSignalMessage: TypeAlias = (
 	| tuple[Literal["subscription_permission_update"], SubscriptionPermissionUpdate]
 	| tuple[Literal["subscription_response"], SubscriptionResponse]
 	| tuple[Literal["pong_resp"], Pong]
+	| tuple[Literal["track_published"], TrackPublishedResponse]
+	| tuple[Literal["request_response"], RequestResponse]
 	| tuple[Literal["response"], SignalResponse]
 )
 
@@ -222,6 +225,10 @@ class LiveKitSignal:
 				return kind, response.subscription_response
 			case "pong_resp":
 				return kind, response.pong_resp
+			case "track_published":
+				return kind, response.track_published
+			case "request_response":
+				return kind, response.request_response
 			case _:
 				self._logger.debug(
 					"Unhandled LiveKit signaling response: %s",
@@ -515,15 +522,13 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 			ice_servers = list(join.ice_servers)
 			self._send_ice_servers(ice_servers)
 
-			if all(
-				any(
-					track.sid
-					and (track.type, track.source) == required_track
-					for participant in join.other_participants
-					for track in participant.tracks
-				)
-				for required_track in _CAMERA_TRACK_KIND_BY_TYPE_SOURCE
-			):
+			published_tracks = {
+				(track.type, track.source)
+				for participant in join.other_participants
+				for track in participant.tracks
+				if track.sid
+			}
+			if published_tracks.issuperset(_CAMERA_TRACK_KIND_BY_TYPE_SOURCE):
 				async with self._request_queue.sending(signal.send):
 					await self._run_browser_signal(signal)
 				return
@@ -572,22 +577,11 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 							response.track_sid,
 							response.err,
 						)
-				case ("response", response) if response.WhichOneof("message") == "track_published":
-					if response.track_published.cid in self._microphone_tracks:
+				case ("track_published", track):
+					if track.cid in self._microphone_tracks:
 						self._logger.debug("LiveKit accepted microphone publication")
-				case ("response", response) if response.WhichOneof("message") == "request_response":
-					result = response.request_response
-					if (
-						result.WhichOneof("request") == "add_track"
-						and result.add_track.cid in self._microphone_tracks
-						and result.reason not in {RequestResponse.OK, RequestResponse.QUEUED}
-					):
-						self._logger.error("LiveKit rejected microphone publication: reason=%s", result.reason)
-						if self._send_message is not None:
-							self._send_message(WebRTCError(
-								code="microphone_publish_failed",
-								message="LiveKit rejected microphone publication",
-							))
+				case ("request_response", response):
+					self._on_request_response(response)
 				case ("pong_resp", _):
 					pass
 				case (kind, response):
@@ -596,6 +590,21 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 						kind,
 						response,
 					)
+
+	def _on_request_response(self, response: RequestResponse) -> None:
+		"""Report a rejected microphone publication to Home Assistant."""
+		if response.reason in {RequestResponse.OK, RequestResponse.QUEUED}:
+			return
+		if response.WhichOneof("request") != "add_track":
+			return
+		if response.add_track.cid not in self._microphone_tracks:
+			return
+		self._logger.error("LiveKit rejected microphone publication: reason=%s", response.reason)
+		if send_message := self._send_message:
+			send_message(WebRTCError(
+				code="microphone_publish_failed",
+				message="LiveKit rejected microphone publication",
+			))
 
 	def _on_answer(self, answer: SessionDescription) -> None:
 		if not self._pending_answers:
