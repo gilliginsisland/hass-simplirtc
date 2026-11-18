@@ -556,7 +556,7 @@ class RawRtpReceiver(RTCRtpReceiver):
 	@override
 	async def receive(self, parameters: RTCRtpReceiveParameters) -> None:
 		if self._raw_started:
-			return
+			self._raw_bridge.unregister_input(side=self._raw_side, peer_id=self._raw_peer_id, kind=self._raw_kind)
 		self._raw_bridge.register_input(
 			side=self._raw_side,
 			peer_id=self._raw_peer_id,
@@ -636,6 +636,17 @@ class RawRtpPeerConnection(RTCPeerConnection):
 				self._remote_supported_codecs_by_kind.setdefault(transceiver.kind, []).extend(
 					transceiver._codecs
 				)
+
+	@override
+	async def setLocalDescription(self, sessionDescription: RTCSessionDescription | None = None) -> None:
+		await super().setLocalDescription(sessionDescription)
+		# LiveKit can add tracks while the data-channel DTLS handshake is still
+		# running. aiortc's connect pass can then skip starting those receivers.
+		# Raw receivers only register routing metadata, so they can be ready as
+		# soon as negotiation completes, before the first media packet arrives.
+		for transceiver in self.getTransceivers():
+			if transceiver.currentDirection in {"recvonly", "sendrecv"}:
+				await transceiver.receiver.receive(self._RTCPeerConnection__remoteRtp(transceiver))
 
 	def remote_media_kinds(self) -> tuple[str, ...]:
 		"""Return media kinds from the already-applied remote description."""
