@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from functools import wraps
 import logging
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Self, TypeVar
 
 from homeassistant.components import websocket_api
 from homeassistant.components.camera import (
@@ -36,56 +38,161 @@ class WebRTCClientConfigurationMixin:
 
 
 class MessageQueue(Generic[_MessageT]):
-	"""Queue messages until signaling is ready to send them."""
+	"""Buffer messages until a scoped sender is available."""
 
 	def __init__(self) -> None:
-		self._pending: list[_MessageT] = []
-		self._sender: Callable[[_MessageT], Awaitable[None]] | None = None
+		self._pending: asyncio.Queue[_MessageT] = asyncio.Queue()
+		self._sending = False
 
 	async def add(self, message: _MessageT) -> None:
-		"""Add a message or send it immediately when a sender is available."""
-		if self._sender is None:
-			self._pending.append(message)
-			return
-		await self._sender(message)
+		"""Enqueue without doing network I/O in a Home Assistant callback."""
+		self._pending.put_nowait(message)
 
-	async def flush(self, sender: Callable[[_MessageT], Awaitable[None]]) -> None:
-		"""Send queued messages and use sender for future messages."""
-		self._sender = sender
-		pending = self._pending
-		self._pending = []
-		for message in pending:
-			await sender(message)
+	@asynccontextmanager
+	async def sending(self, sender: Callable[[_MessageT], Awaitable[None]]) -> AsyncIterator[None]:
+		"""Own the sender task for exactly the surrounding connection scope."""
+		if self._sending:
+			raise RuntimeError("A sender is already running")
+		async def send_loop() -> None:
+			while True:
+				await sender(await self._pending.get())
+
+		async with asyncio.TaskGroup() as tasks:
+			task = tasks.create_task(send_loop(), name="simplirtc-signaling-sender")
+			self._sending = True
+			try:
+				yield
+			finally:
+				self._sending = False
+				task.cancel()
 
 	def clear(self) -> None:
-		"""Drop queued messages and reset the sender."""
-		self._pending.clear()
-		self._sender = None
+		"""Drop messages after the session owner has finished."""
+		while not self._pending.empty():
+			self._pending.get_nowait()
 
 	@property
 	def flushed(self) -> bool:
-		"""Return whether messages are sent immediately."""
-		return self._sender is not None
+		"""Return whether this connection has a sender."""
+		return self._sending
 
 
-class SimpliSafeWebRTCSession(ABC):
-	"""A provider-specific WebRTC session."""
+class SimpliSafeWebRTCSession(ABC, Generic[_MessageT]):
+	"""Own a provider's connection scopes across independent HA requests."""
+
+	def __init__(self, *, logger: logging.Logger, name: str) -> None:
+		self._logger = logger
+		self._name = name
+		self._task: asyncio.Task[None] | None = None
+		self._on_close: Callable[[], None] | None = None
+		self._closed = asyncio.Event()
+		self._close_requested = False
+		self._offer_received = asyncio.Event()
+		self._send_message: WebRTCSendMessage | None = None
+		self._request_queue = MessageQueue[_MessageT]()
+
+	async def __aenter__(self) -> Self:
+		self.start(lambda: None)
+		return self
+
+	async def __aexit__(self, *exc: Any) -> None:
+		self.close()
+		await self.wait_closed()
+
+	@property
+	def closing(self) -> bool:
+		"""Return whether shutdown was requested or the owner has exited."""
+		return self._close_requested or (self._task is not None and self._task.done())
+
+	def start(
+		self, on_close: Callable[[], None], *,
+		create_task: Callable[..., asyncio.Task[None]] = asyncio.create_task,
+		unused_timeout: float | None = None,
+	) -> None:
+		"""Start one lifetime owner, optionally tied to HA's config entry."""
+		if self._task is not None or self._close_requested:
+			raise RuntimeError("Session has already been started or closed")
+		self._on_close = on_close
+		owner = self._run(unused_timeout)
+		try:
+			self._task = create_task(owner, name=self._name)
+		except BaseException:
+			owner.close()
+			self._close_requested = True
+			self._closed.set()
+			self._on_close = None
+			raise
+		# A done callback also runs when canceled before the coroutine first starts.
+		self._task.add_done_callback(self._finished)
+
+	async def _run(self, unused_timeout: float | None) -> None:
+		try:
+			async with asyncio.TaskGroup() as tasks:
+				expiration = None
+				if unused_timeout is not None:
+					expiration = tasks.create_task(
+						self._expire_unused(unused_timeout), name="simplirtc-unused-session",
+					)
+				try:
+					await self._read()
+				finally:
+					if expiration is not None:
+						expiration.cancel()
+		except Exception:
+			self._logger.exception("Signaling session failed")
+
+	async def _expire_unused(self, timeout: float) -> None:
+		try:
+			async with asyncio.timeout(timeout):
+				await self._offer_received.wait()
+		except TimeoutError:
+			self.close()
+
+	def _finished(self, _task: asyncio.Task[None]) -> None:
+		"""Publish closure only after every owned context has exited."""
+		self._close_requested = True
+		self._request_queue.clear()
+		self._send_message = None
+		self._closed.set()
+		if on_close := self._on_close:
+			self._on_close = None
+			on_close()
+
+	def _check_open(self) -> None:
+		if self._task is None or self.closing:
+			raise RuntimeError("Session is not running")
+
+	def _accept_offer(self, send_message: WebRTCSendMessage) -> None:
+		self._check_open()
+		self._send_message = send_message
+		self._offer_received.set()
+
+	def close(self) -> None:
+		"""Request shutdown; repeated requests cannot interrupt cleanup."""
+		if self._close_requested:
+			return
+		self._close_requested = True
+		if self._task is not None:
+			if not self._task.cancelling():
+				self._task.cancel()
+		else:
+			self._closed.set()
+
+	async def wait_closed(self) -> None:
+		"""Wait for cleanup without propagating caller cancellation to the owner."""
+		await self._closed.wait()
 
 	@abstractmethod
-	def start(self, on_close: Callable[[], None]) -> None:
-		"""Start provider signaling before the browser offer arrives."""
+	async def _read(self) -> None:
+		"""Run the provider's connection contexts and receive loop."""
 
 	@abstractmethod
 	async def handle_offer(self, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
-		"""Handle a browser offer for this session."""
+		"""Queue a browser offer for this session."""
 
 	@abstractmethod
 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
-		"""Send a browser ICE candidate to the provider session."""
-
-	@abstractmethod
-	def close(self) -> None:
-		"""Close the session."""
+		"""Queue a browser ICE candidate for this session."""
 
 
 async def async_register_webrtc_client_config_handler(

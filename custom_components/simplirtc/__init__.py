@@ -99,3 +99,8 @@ async def _async_remove_config_entries(hass: HomeAssistant, entry_id: str):
 		for entry in hass.config_entries.async_entries(DOMAIN)
 		if entry.data.get(ATTR_CONFIG_ENTRY_ID) == entry_id
 	))
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[SimpliSafe]) -> bool:
+	"""Unload entities, awaiting their provider-session cleanup."""
+	return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

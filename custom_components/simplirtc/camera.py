@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-import functools
 import logging
 from typing import TypeVar, override
 
@@ -65,7 +64,7 @@ async def async_setup_entry(
 			continue
 
 		for camera in system.cameras.values():
-			cameras.append(SimpliSafeCamera(simplisafe, system, camera))
+			cameras.append(SimpliSafeCamera(simplisafe, system, camera, entry))
 
 	async_add_entities(cameras)
 
@@ -128,6 +127,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		simplisafe: SimpliSafe,
 		system: SystemV3,
 		device: Camera,
+		entry: ConfigEntry[SimpliSafe],
 	) -> None:
 		"""Initialize the SimpliSafe camera."""
 		super().__init__(
@@ -143,9 +143,10 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		self._attr_supported_features |= CameraEntityFeature.STREAM
 		self._device: Camera
 		self._sessions: dict[str, SimpliSafeWebRTCSession] = {}
-		self._unused_session_expirations: dict[
-			SimpliSafeWebRTCSession, asyncio.TimerHandle
-		] = {}
+		self._entry = entry
+		self._unused_sessions: dict[SimpliSafeWebRTCSession, None] = {}
+		self._provider_sessions: set[SimpliSafeWebRTCSession] = set()
+		self._removing = False
 		self._snapshot_template_url: str | None = None
 
 	@override
@@ -242,57 +243,80 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		"""Return camera-specific state attributes."""
 		return {"webrtc_provider": self._web_rtc_provider}
 
+	@override
+	async def async_will_remove_from_hass(self) -> None:
+		"""Stop accepting sessions and await all their connection scopes."""
+		self._removing = True
+		sessions = tuple(self._provider_sessions)
+		for session in sessions:
+			session.close()
+		await asyncio.gather(*(session.wait_closed() for session in sessions))
+		await super().async_will_remove_from_hass()
+
 	async def async_prepare_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
-		"""Create an unused provider session and return its client configuration."""
+		"""Start a scoped provider session and wait for its ICE configuration."""
+		if self._removing:
+			raise HomeAssistantError("Camera is being removed")
 		ice_servers: list[KinesisIceServer | LiveKitIceServer] = []
+		ice_servers_ready: asyncio.Future[None] = self.hass.loop.create_future()
+
+		def send_ice_servers(servers: list[LiveKitIceServer]) -> None:
+			ice_servers.extend(servers)
+			if not ice_servers_ready.done():
+				ice_servers_ready.set_result(None)
+
 		match self._web_rtc_provider:
 			case "mist":
 				live_view = await self._create_stream(LiveKitResponse)
-				ice_servers_ready: asyncio.Future[None] = self.hass.loop.create_future()
-
-				def send_ice_servers(servers: list[LiveKitIceServer]) -> None:
-					ice_servers.extend(servers)
-					if not ice_servers_ready.done():
-						ice_servers_ready.set_result(None)
-
-				def close_before_ice_servers() -> None:
-					if not ice_servers_ready.done():
-						ice_servers_ready.set_exception(HomeAssistantError(
-							f"LiveKit session closed before ICE servers were received for {self.entity_id}"
-						))
-
 				session = LiveKitSession(
 					livekit_url=live_view.liveKitDetails.liveKitURL,
 					user_token=live_view.liveKitDetails.userToken,
 					send_ice_servers=send_ice_servers,
 				)
-
-				def on_close() -> None:
-					close_before_ice_servers()
-					self._expire(session)
-
-				session.start(on_close)
-				try:
-					async with asyncio.timeout(15):
-						await ice_servers_ready
-				except (Exception, asyncio.CancelledError):
-					session.close()
-					raise
 			case "kvs":
 				live_view = await self._create_stream(KenisisResponse)
 				ice_servers.extend(live_view.iceServers)
+				ice_servers_ready.set_result(None)
 				session = KinesisSession(
 					channel_endpoint=live_view.signedChannelEndpoint,
 					client_id=live_view.clientId,
 				)
-				session.start(functools.partial(self._expire, session))
 			case _ as provider:
 				raise HomeAssistantError(
 					f"Camera {self.name} has unknown webrtc provider {provider!r}"
 				)
 
-		self._pool_unused_webrtc_session(session)
+		# Removal can happen while the live-view API request is in flight.
+		if self._removing:
+			raise HomeAssistantError("Camera is being removed")
 
+		def on_close() -> None:
+			self._session_closed(session)
+			if not ice_servers_ready.done():
+				ice_servers_ready.set_exception(HomeAssistantError(
+					f"Session closed before ICE configuration for {self.entity_id}"
+				))
+
+		self._provider_sessions.add(session)
+		try:
+			session.start(
+				on_close,
+				create_task=lambda coro, *, name: self._entry.async_create_background_task(
+					self.hass, coro, name, eager_start=False,
+				),
+				unused_timeout=UNUSED_WEBRTC_SESSION_TTL,
+			)
+			async with asyncio.timeout(15):
+				await ice_servers_ready
+		except (Exception, asyncio.CancelledError):
+			session.close()
+			await session.wait_closed()
+			self._provider_sessions.discard(session)
+			raise
+
+		if session not in self._provider_sessions or session.closing:
+			raise HomeAssistantError("Session closed while preparing configuration")
+		self._unused_sessions[session] = None
 		config = WebRTCClientConfiguration()
 		config.configuration.ice_servers.extend(
 			RTCIceServer(
@@ -302,7 +326,6 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 			)
 			for ice_server in ice_servers
 		)
-
 		return config
 
 	@override
@@ -311,20 +334,19 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 	) -> None:
 		"""Handle a WebRTC offer."""
 		if not (session := self._sessions.get(session_id)):
-			if (session := next(iter(self._unused_session_expirations), None)) is None:
+			if (session := next(iter(self._unused_sessions), None)) is None:
 				raise HomeAssistantError(f"No prepared WebRTC session for {self.entity_id}")
 
-			expiration = self._unused_session_expirations.pop(session)
-			expiration.cancel()
+			self._unused_sessions.pop(session)
 			_LOGGER.debug("Using pooled WebRTC session for %s", self.entity_id)
 			self._sessions[session_id] = session
 		else:
 			_LOGGER.debug("Renegotiating WebRTC session for %s", self.entity_id)
 		try:
 			await session.handle_offer(offer_sdp, send_message)
-		except Exception:
-			self._sessions.pop(session_id, None)
+		except (Exception, asyncio.CancelledError):
 			session.close()
+			await session.wait_closed()
 			raise
 
 	@override
@@ -332,7 +354,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		self, session_id: str, candidate: RTCIceCandidateInit
 	) -> None:
 		"""Handle a WebRTC candidate."""
-		if (session := self._sessions.get(session_id)):
+		if (session := self._sessions.get(session_id)) and not session.closing:
 			await session.send_candidate(candidate)
 		else:
 			_LOGGER.debug("Ignoring WebRTC candidate for closed session %s", session_id)
@@ -341,21 +363,14 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 	@callback
 	def close_webrtc_session(self, session_id: str) -> None:
 		"""Close a WebRTC session."""
-		if (session := self._sessions.pop(session_id, None)):
+		if session := self._sessions.get(session_id):
 			session.close()
 
 	@callback
-	def _pool_unused_webrtc_session(
-		self,
-		session: SimpliSafeWebRTCSession,
-	) -> None:
-		"""Pool a session prepared by a client config request."""
-		self._unused_session_expirations[session] = self.hass.loop.call_later(
-			UNUSED_WEBRTC_SESSION_TTL, self._expire, session,
-		)
-
-	@callback
-	def _expire(self, session: SimpliSafeWebRTCSession) -> None:
-		"""Close an unused prepared session if the offer never arrives."""
-		if self._unused_session_expirations.pop(session, None) is not None:
-			session.close()
+	def _session_closed(self, session: SimpliSafeWebRTCSession) -> None:
+		"""Remove routing entries only after the provider has finished cleanup."""
+		self._provider_sessions.discard(session)
+		self._unused_sessions.pop(session, None)
+		for session_id, active in tuple(self._sessions.items()):
+			if active is session:
+				del self._sessions[session_id]

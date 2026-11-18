@@ -17,7 +17,7 @@ import json
 import logging
 from secrets import token_hex
 import time
-from typing import Literal, TypeAlias, override
+from typing import Any, Literal, Self, TypeAlias, override
 from urllib.parse import urlencode
 
 from aiohttp import (
@@ -66,7 +66,7 @@ from .protobufs.livekit_rtc_pb2 import (
 	TrickleRequest,
 	WrappedJoinRequest,
 )
-from .webrtc import MessageQueue, SimpliSafeWebRTCSession
+from .webrtc import SimpliSafeWebRTCSession
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,7 +77,6 @@ _CAMERA_TRACK_KIND_BY_TYPE_SOURCE = {
 	(VIDEO, CAMERA): "video",
 }
 
-SessionClosedCallback = Callable[[], None]
 SendIceServers = Callable[[list[ICEServer]], None]
 LiveKitSignalMessage: TypeAlias = (
 	tuple[Literal["join"], JoinResponse]
@@ -293,47 +292,50 @@ class WarmupSession:
 		self._track_sid_by_kind: dict[str, str] = {}
 		self._allowed_track_sids: set[str] = set()
 
+	async def __aenter__(self) -> Self:
+		return self
+
+	async def __aexit__(self, *exc: Any) -> None:
+		await self._peer_connection.close()
+
 	async def run(self) -> None:
-		"""Run warmup until camera tracks are published and allowed."""
-		try:
-			await self._send_peer_offer()
-			async for message in self._signal:
-				match message:
-					case ("answer", answer):
-						await self._on_answer(answer)
-					case ("trickle", trickle):
-						await self._on_trickle(trickle)
-					case ("media_sections_requirement", _):
-						await self._send_peer_offer()
-					case ("update", update):
-						self._on_participant_update(update)
-					case ("subscription_permission_update", update):
-						self._on_subscription_permission_update(update)
-					case ("subscription_response", response):
-						if response.err:
-							self._logger.warning(
-								"LiveKit aiortc warmup subscription failed: track=%s error=%s",
-								response.track_sid,
-								response.err,
-							)
-					case ("pong_resp", _):
-						pass
-					case (kind, response):
-						self._logger.debug(
-							"Unhandled LiveKit aiortc warmup message kind=%s response=%s",
-							kind,
-							response,
+		"""Negotiate until camera tracks are published and allowed."""
+		await self._send_peer_offer()
+		async for message in self._signal:
+			match message:
+				case ("answer", answer):
+					await self._on_answer(answer)
+				case ("trickle", trickle):
+					await self._on_trickle(trickle)
+				case ("media_sections_requirement", _):
+					await self._send_peer_offer()
+				case ("update", update):
+					self._on_participant_update(update)
+				case ("subscription_permission_update", update):
+					self._on_subscription_permission_update(update)
+				case ("subscription_response", response):
+					if response.err:
+						self._logger.warning(
+							"LiveKit aiortc warmup subscription failed: track=%s error=%s",
+							response.track_sid,
+							response.err,
 						)
+				case ("pong_resp", _):
+					pass
+				case (kind, response):
+					self._logger.debug(
+						"Unhandled LiveKit aiortc warmup message kind=%s response=%s",
+						kind,
+						response,
+					)
 
-				if not self._waiting_for_track_permissions:
-					return
+			if not self._waiting_for_track_permissions:
+				return
 
-			raise RuntimeError(
-				"LiveKit aiortc warmup websocket closed before camera track permissions were allowed: waiting_for="
-				f"{sorted(self._waiting_for_track_permissions)}"
-			)
-		finally:
-			await self._peer_connection.close()
+		raise RuntimeError(
+			"LiveKit aiortc warmup websocket closed before camera track permissions were allowed: waiting_for="
+			f"{sorted(self._waiting_for_track_permissions)}"
+		)
 
 	async def _send_peer_offer(self) -> None:
 		await self._peer_connection.setLocalDescription()
@@ -416,7 +418,7 @@ class WarmupSession:
 				return track_kind
 		return None
 
-class LiveKitSession(SimpliSafeWebRTCSession):
+class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 	"""A browser-offer LiveKit signaling session for Home Assistant."""
 
 	def __init__(
@@ -430,43 +432,13 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 		self._user_token = user_token
 		self._send_ice_servers = send_ice_servers
 		self._id = token_hex(4)
-		self._send_message: WebRTCSendMessage | None = None
-		self._on_close: SessionClosedCallback | None = None
-		self._logger = _LOGGER.getChild(f"session.{self._id}")
-
+		super().__init__(logger=_LOGGER.getChild(f"session.{self._id}"), name=f"simplirtc-livekit-{self._id}")
 		self._offer_sdp: str | None = None
 		self._pending_answers: deque[bool] = deque()
-		self._reader_task: asyncio.Task[None] | None = None
-		self._request_queue = MessageQueue[SignalRequest]()
-
-	@override
-	def start(self, on_close: SessionClosedCallback) -> None:
-		"""Start the no-offer LiveKit join used for ICE and optional warmup."""
-		if self._reader_task is not None:
-			raise RuntimeError(f"LiveKit session {self._id} already started")
-
-		self._on_close = on_close
-
-		async def reader_task() -> None:
-			try:
-				await self._read()
-			except Exception as err:
-				self._logger.error("Error in LiveKit session: %s", err)
-			finally:
-				self._reader_task = None
-				self.close()
-
-		self._reader_task = asyncio.create_task(
-			reader_task(),
-			name=f"simplirtc-livekit-{self._id}",
-		)
-
 	@override
 	async def handle_offer(self, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
 		"""Handle a browser offer with the prepared LiveKit session."""
-		if self._reader_task is None:
-			raise RuntimeError(f"LiveKit session {self._id} was not started")
-		self._send_message = send_message
+		self._accept_offer(send_message)
 		self._offer_sdp = offer_sdp
 		self._pending_answers.append(True)
 		await self._request_queue.add(SignalRequest(offer=SessionDescription(
@@ -476,7 +448,8 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 
 	@override
 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
-		"""Forward a browser ICE candidate to LiveKit."""
+		"""Queue a browser ICE candidate for LiveKit."""
+		self._check_open()
 		# LiveKit rejects the browser's final null ICE event if it is serialized
 		# as an empty candidateInit, and the session works without forwarding it.
 		if not candidate.candidate:
@@ -494,18 +467,6 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 				target=SignalTarget.PUBLISHER,
 			),
 		))
-
-	@override
-	def close(self) -> None:
-		"""Stop this LiveKit signaling session."""
-		self._request_queue.clear()
-		self._pending_answers.clear()
-		if (reader_task := self._reader_task) is not None:
-			self._reader_task = None
-			reader_task.cancel()
-		if on_close := self._on_close:
-			self._on_close = None
-			on_close()
 
 	async def _read(self) -> None:
 		"""Run initial signaling, optional warmup, and browser signaling."""
@@ -540,12 +501,13 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 				)
 				for required_track in _CAMERA_TRACK_KIND_BY_TYPE_SOURCE
 			):
-				await self._request_queue.flush(signal.send)
-				await self._run_browser_signal(signal)
+				async with self._request_queue.sending(signal.send):
+					await self._run_browser_signal(signal)
 				return
 
 			try:
-				await WarmupSession(signal, ice_servers=ice_servers).run()
+				async with WarmupSession(signal, ice_servers=ice_servers) as warmup:
+					await warmup.run()
 			except Exception as err:
 				self._logger.warning(
 					"LiveKit aiortc warmup failed; continuing with browser offer: %s",
@@ -553,20 +515,24 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 				)
 
 		async with LiveKitSignal.connect(
-			self._livekit_url,
-			token=self._user_token,
-			auto_subscribe=True,
+			self._livekit_url, token=self._user_token, auto_subscribe=True,
 			logger=self._logger.getChild("browser"),
 		) as signal:
-			await self._run_browser_signal(signal)
+			async for kind, message in signal:
+				if kind == "join":
+					break
+				if kind == "leave":
+					raise RuntimeError(f"LiveKit left before browser join: reason={message.reason}")
+			else:
+				raise RuntimeError("LiveKit websocket closed before browser join")
+			async with self._request_queue.sending(signal.send):
+				await self._run_browser_signal(signal)
 
 	async def _run_browser_signal(self, signal: LiveKitSignal) -> None:
 		"""Handle LiveKit signaling for the browser-owned peer connection."""
 
 		async for message in signal:
 			match message:
-				case ("join", _):
-					await self._request_queue.flush(signal.send)
 				case ("answer", answer):
 					self._on_answer(answer)
 				case ("trickle", trickle):
@@ -574,10 +540,8 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 				case ("media_sections_requirement", requirement):
 					await self._on_media_sections_requirement(requirement)
 				case ("leave", leave):
-					self._logger.warning(
-						"LiveKit browser signal left: reason=%s",
-						leave.reason,
-					)
+					self._logger.debug("LiveKit browser signal left: reason=%s", leave.reason)
+					return
 				case ("subscription_response", response):
 					if response.err:
 						self._logger.warning(
@@ -593,9 +557,6 @@ class LiveKitSession(SimpliSafeWebRTCSession):
 						kind,
 						response,
 					)
-
-		if not self._request_queue.flushed:
-			raise RuntimeError("LiveKit websocket closed before join response")
 
 	def _on_answer(self, answer: SessionDescription) -> None:
 		if not self._pending_answers:
