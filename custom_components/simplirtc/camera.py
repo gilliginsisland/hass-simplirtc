@@ -38,7 +38,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .kinesis import KinesisSession
-from .livekit import LiveKitSession
+from .livekit_sfu import LiveKitSfu, SfuSession
 from .protobufs.livekit_rtc_pb2 import ICEServer as LiveKitIceServer
 from .webrtc import (
 	WebRTCClientConfigurationMixin,
@@ -239,6 +239,9 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		self._platform_ready = asyncio.Event()
 		self.async_on_remove(self._platform_ready.set)
 		self._snapshot_template_url: str | None = None
+		self._sfu_room: LiveKitSfu | None = None
+		if _camera_web_rtc_provider(device) == "mist":
+			self._attr_camera_entity_capabilities = CameraEntityCapabilities(two_way_audio=False)
 
 	@override
 	async def async_camera_image(
@@ -347,6 +350,8 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		for session in sessions:
 			session.close()
 		await asyncio.gather(*(session.wait_closed() for session in sessions))
+		if self._sfu_room is not None:
+			await self._sfu_room.close()
 		await super().async_will_remove_from_hass()
 
 	async def async_prepare_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
@@ -363,12 +368,18 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 
 		match self._web_rtc_provider:
 			case "mist":
-				live_view = await self._create_stream(LiveKitResponse)
-				session = LiveKitSession(
-					livekit_url=live_view.liveKitDetails.liveKitURL,
-					user_token=live_view.liveKitDetails.userToken,
-					send_ice_servers=send_ice_servers,
-				)
+				if self._sfu_room is None:
+					async def get_connection_info() -> tuple[str, str]:
+						live_view = await self._create_stream(LiveKitResponse)
+						details = live_view.liveKitDetails
+						return details.liveKitURL, details.userToken
+					self._sfu_room = LiveKitSfu(
+						get_connection_info,
+						create_task=lambda coro, *, name: self._entry.async_create_background_task(
+							self.hass, coro, name, eager_start=False,
+						),
+					)
+				session = SfuSession(self._sfu_room, send_ice_servers=send_ice_servers)
 			case "kvs":
 				live_view = await self._create_stream(KenisisResponse)
 				ice_servers_ready.set_result(live_view.iceServers)
