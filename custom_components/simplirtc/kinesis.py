@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from abc import ABC
 import base64
 from dataclasses import asdict
 import json
@@ -26,7 +25,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True, slots=True, config={"extra": "ignore"})
-class KinesisMessage(ABC):
+class KinesisMessage:
 	messagePayload: str | None = None
 
 	@property
@@ -77,7 +76,7 @@ class KinesisSession(SimpliSafeWebRTCSession[KinesisRequest]):
 			correlationId=f"{self._id}.{self._next_correlation_id()}",
 		)
 		offer_msg.payload = {"type": "offer", "sdp": offer_sdp}
-		await self._request_queue.add(offer_msg)
+		self._request_queue.put_nowait(offer_msg)
 
 	@override
 	async def send_candidate(self, candidate: RTCIceCandidateInit) -> None:
@@ -93,7 +92,7 @@ class KinesisSession(SimpliSafeWebRTCSession[KinesisRequest]):
 			"sdpMLineIndex": candidate.sdp_m_line_index,
 			"usernameFragment": None,
 		}
-		await self._request_queue.add(candidate_msg)
+		self._request_queue.put_nowait(candidate_msg)
 
 	def _next_correlation_id(self) -> int:
 		self._message_count += 1

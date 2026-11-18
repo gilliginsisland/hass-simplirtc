@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import logging
 from typing import TypeVar, override
 
@@ -353,13 +353,13 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 		"""Start a scoped provider session and wait for its ICE configuration."""
 		if self._removing:
 			raise HomeAssistantError("Camera is being removed")
-		ice_servers: list[KinesisIceServer | LiveKitIceServer] = []
-		ice_servers_ready: asyncio.Future[None] = self.hass.loop.create_future()
+		ice_servers_ready: asyncio.Future[Sequence[KinesisIceServer | LiveKitIceServer]] = (
+			self.hass.loop.create_future()
+		)
 
 		def send_ice_servers(servers: list[LiveKitIceServer]) -> None:
-			ice_servers.extend(servers)
 			if not ice_servers_ready.done():
-				ice_servers_ready.set_result(None)
+				ice_servers_ready.set_result(servers)
 
 		match self._web_rtc_provider:
 			case "mist":
@@ -371,8 +371,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 				)
 			case "kvs":
 				live_view = await self._create_stream(KenisisResponse)
-				ice_servers.extend(live_view.iceServers)
-				ice_servers_ready.set_result(None)
+				ice_servers_ready.set_result(live_view.iceServers)
 				session = KinesisSession(
 					channel_endpoint=live_view.signedChannelEndpoint,
 					client_id=live_view.clientId,
@@ -403,7 +402,7 @@ class SimpliSafeCamera(  # pyright: ignore[reportUnsafeMultipleInheritance]
 				unused_timeout=UNUSED_WEBRTC_SESSION_TTL,
 			)
 			async with asyncio.timeout(15):
-				await ice_servers_ready
+				ice_servers = await ice_servers_ready
 		except (Exception, asyncio.CancelledError):
 			session.close()
 			await session.wait_closed()

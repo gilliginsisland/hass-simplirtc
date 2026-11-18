@@ -296,9 +296,6 @@ class WarmupSession:
 		self._peer_connection.addTransceiver("audio", direction="recvonly")
 		self._peer_connection.addTransceiver("video", direction="recvonly")
 
-		self._waiting_for_track_permissions = set(
-			_CAMERA_TRACK_KIND_BY_TYPE_SOURCE.values()
-		)
 		self._track_sid_by_kind: dict[str, str] = {}
 		self._allowed_track_sids: set[str] = set()
 
@@ -404,10 +401,6 @@ class WarmupSession:
 					(track.type, track.source)
 				):
 					self._track_sid_by_kind[track_kind] = track.sid
-					if track.sid in self._allowed_track_sids:
-						self._waiting_for_track_permissions.discard(track_kind)
-					else:
-						self._waiting_for_track_permissions.add(track_kind)
 
 	def _on_subscription_permission_update(
 		self,
@@ -415,18 +408,17 @@ class WarmupSession:
 	) -> None:
 		if update.allowed:
 			self._allowed_track_sids.add(update.track_sid)
-			if track_kind := self._track_kind_for_sid(update.track_sid):
-				self._waiting_for_track_permissions.discard(track_kind)
 		else:
 			self._allowed_track_sids.discard(update.track_sid)
-			if track_kind := self._track_kind_for_sid(update.track_sid):
-				self._waiting_for_track_permissions.add(track_kind)
 
-	def _track_kind_for_sid(self, track_sid: str) -> str | None:
-		for track_kind, current_track_sid in self._track_sid_by_kind.items():
-			if current_track_sid == track_sid:
-				return track_kind
-		return None
+	@property
+	def _waiting_for_track_permissions(self) -> set[str]:
+		"""Derive readiness regardless of whether tracks or permissions arrive first."""
+		return {
+			kind for kind in _CAMERA_TRACK_KIND_BY_TYPE_SOURCE.values()
+			if self._track_sid_by_kind.get(kind) not in self._allowed_track_sids
+		}
+
 
 class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 	"""A browser-offer LiveKit signaling session for Home Assistant."""
@@ -466,12 +458,12 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 			track_id = msid[1]
 			if track_id in self._microphone_tracks:
 				continue
-			await self._request_queue.add(SignalRequest(add_track=AddTrackRequest(
+			self._request_queue.put_nowait(SignalRequest(add_track=AddTrackRequest(
 				cid=track_id, name="microphone", type=AUDIO, source=MICROPHONE,
 			)))
 			self._microphone_tracks.add(track_id)
 		self._pending_answers.append(True)
-		await self._request_queue.add(SignalRequest(offer=SessionDescription(
+		self._request_queue.put_nowait(SignalRequest(offer=SessionDescription(
 			type="offer",
 			sdp=offer_sdp,
 		)))
@@ -491,7 +483,7 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 		if candidate.sdp_m_line_index is not None:
 			candidate_init["sdpMLineIndex"] = candidate.sdp_m_line_index
 
-		await self._request_queue.add(SignalRequest(
+		self._request_queue.put_nowait(SignalRequest(
 			trickle=TrickleRequest(
 				candidateInit=json.dumps(candidate_init, separators=(",", ":")),
 				target=SignalTarget.PUBLISHER,
@@ -658,7 +650,7 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 			self._logger.warning("LiveKit requested media sections before browser offer")
 			return
 		self._pending_answers.append(False)
-		await self._request_queue.add(SignalRequest(offer=SessionDescription(
+		self._request_queue.put_nowait(SignalRequest(offer=SessionDescription(
 			type="offer",
 			sdp=self._offer_sdp,
 		)))

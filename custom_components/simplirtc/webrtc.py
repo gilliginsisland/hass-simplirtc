@@ -44,7 +44,7 @@ class MessageQueue(Generic[_MessageT]):
 		self._pending: asyncio.Queue[_MessageT] = asyncio.Queue()
 		self._sending = False
 
-	async def add(self, message: _MessageT) -> None:
+	def put_nowait(self, message: _MessageT) -> None:
 		"""Enqueue without doing network I/O in a Home Assistant callback."""
 		self._pending.put_nowait(message)
 
@@ -70,11 +70,6 @@ class MessageQueue(Generic[_MessageT]):
 		"""Drop messages after the session owner has finished."""
 		while not self._pending.empty():
 			self._pending.get_nowait()
-
-	@property
-	def flushed(self) -> bool:
-		"""Return whether this connection has a sender."""
-		return self._sending
 
 
 class SimpliSafeWebRTCSession(ABC, Generic[_MessageT]):
