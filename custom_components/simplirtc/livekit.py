@@ -27,6 +27,7 @@ from aiohttp import (
 )
 from homeassistant.components.camera import (
 	WebRTCAnswer,  # pyright: ignore[reportPrivateImportUsage]
+	WebRTCError,
 	WebRTCCandidate,  # pyright: ignore[reportPrivateImportUsage]
 	WebRTCSendMessage,  # pyright: ignore[reportPrivateImportUsage]
 )
@@ -39,7 +40,7 @@ from aiortc import (
 	RTCPeerConnection,
 	RTCSessionDescription,
 )
-from aiortc.sdp import candidate_from_sdp
+from aiortc.sdp import SessionDescription as ParsedSDP, candidate_from_sdp
 from .protobufs.livekit_models_pb2 import (
 	AUDIO,
 	CAMERA,
@@ -48,6 +49,7 @@ from .protobufs.livekit_models_pb2 import (
 	VIDEO,
 )
 from .protobufs.livekit_rtc_pb2 import (
+	AddTrackRequest,
 	ConnectionSettings,
 	ICEServer,
 	JoinRequest,
@@ -57,6 +59,7 @@ from .protobufs.livekit_rtc_pb2 import (
 	ParticipantUpdate,
 	Ping,
 	Pong,
+	RequestResponse,
 	SessionDescription,
 	SignalRequest,
 	SignalResponse,
@@ -435,11 +438,31 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 		super().__init__(logger=_LOGGER.getChild(f"session.{self._id}"), name=f"simplirtc-livekit-{self._id}")
 		self._offer_sdp: str | None = None
 		self._pending_answers: deque[bool] = deque()
+		self._microphone_tracks: set[str] = set()
+
 	@override
 	async def handle_offer(self, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
 		"""Handle a browser offer with the prepared LiveKit session."""
 		self._accept_offer(send_message)
 		self._offer_sdp = offer_sdp
+		# LiveKit matches incoming RTP to a track registered through signaling.
+		# An SDP offer alone does not publish the browser's microphone.
+		description = ParsedSDP.parse(offer_sdp)
+		for media in description.media:
+			if media.kind != "audio" or media.port == 0 or media.direction != "sendrecv":
+				continue
+			# HA adds a streamless track (a=msid:- <track-id>), so no stream
+			# appears in msid-semantic. aiortc's webrtc_track_id skips those.
+			msid = media.msid.split() if media.msid else []
+			if len(msid) != 2:
+				continue
+			track_id = msid[1]
+			if track_id in self._microphone_tracks:
+				continue
+			await self._request_queue.add(SignalRequest(add_track=AddTrackRequest(
+				cid=track_id, name="microphone", type=AUDIO, source=MICROPHONE,
+			)))
+			self._microphone_tracks.add(track_id)
 		self._pending_answers.append(True)
 		await self._request_queue.add(SignalRequest(offer=SessionDescription(
 			type="offer",
@@ -549,6 +572,22 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 							response.track_sid,
 							response.err,
 						)
+				case ("response", response) if response.WhichOneof("message") == "track_published":
+					if response.track_published.cid in self._microphone_tracks:
+						self._logger.debug("LiveKit accepted microphone publication")
+				case ("response", response) if response.WhichOneof("message") == "request_response":
+					result = response.request_response
+					if (
+						result.WhichOneof("request") == "add_track"
+						and result.add_track.cid in self._microphone_tracks
+						and result.reason not in {RequestResponse.OK, RequestResponse.QUEUED}
+					):
+						self._logger.error("LiveKit rejected microphone publication: reason=%s", result.reason)
+						if self._send_message is not None:
+							self._send_message(WebRTCError(
+								code="microphone_publish_failed",
+								message="LiveKit rejected microphone publication",
+							))
 				case ("pong_resp", _):
 					pass
 				case (kind, response):
