@@ -25,6 +25,8 @@ from aiohttp import (
 	ClientWebSocketResponse,
 	WSMsgType,
 )
+from pydantic import TypeAdapter, ValidationError, field_validator
+from pydantic.dataclasses import dataclass
 from homeassistant.components.camera import (
 	WebRTCAnswer,  # pyright: ignore[reportPrivateImportUsage]
 	WebRTCError,
@@ -97,6 +99,37 @@ LiveKitSignalMessage: TypeAlias = (
 	| tuple[Literal["request_response"], RequestResponse]
 	| tuple[Literal["response"], SignalResponse]
 )
+
+
+@dataclass(kw_only=True, slots=True, config={"hide_input_in_errors": True})
+class LiveKitIceCandidate:
+	"""Validated candidate metadata shared by both LiveKit receive paths."""
+
+	candidate: str
+	sdpMid: str | None = None
+	sdpMLineIndex: int | None = None
+
+	@field_validator("sdpMid", mode="before")
+	@classmethod
+	def _normalize_mid(cls, value: object) -> object:
+		return value if isinstance(value, str) else None
+
+	@field_validator("sdpMLineIndex", mode="before")
+	@classmethod
+	def _normalize_m_line_index(cls, value: object) -> object:
+		return value if isinstance(value, int) else None
+
+
+_ICE_CANDIDATE_ADAPTER = TypeAdapter(LiveKitIceCandidate)
+
+
+def _parse_ice_candidate(value: str, logger: logging.Logger) -> LiveKitIceCandidate | None:
+	"""Drop invalid candidates without exposing their contents in validation logs."""
+	try:
+		return _ICE_CANDIDATE_ADAPTER.validate_json(value)
+	except ValidationError as err:
+		logger.warning("Dropping invalid LiveKit ICE candidate: %s", err)
+		return None
 
 
 class LiveKitSignal:
@@ -365,29 +398,14 @@ class WarmupSession:
 				await self._peer_connection.addIceCandidate(None)
 			return
 
-		try:
-			init = json.loads(trickle.candidateInit)
-		except ValueError as err:
-			self._logger.warning(
-				"Dropping invalid LiveKit aiortc warmup ICE candidate JSON: %s",
-				err,
-			)
+		if (init := _parse_ice_candidate(trickle.candidateInit, self._logger)) is None:
 			return
 
-		candidate_sdp = init.get("candidate")
-		if not isinstance(candidate_sdp, str):
-			self._logger.warning(
-				"Dropping LiveKit aiortc warmup ICE candidate without candidate field"
-			)
-			return
-
-		candidate = candidate_from_sdp(candidate_sdp.removeprefix("candidate:"))
-		sdp_mid = init.get("sdpMid")
-		sdp_m_line_index = init.get("sdpMLineIndex")
-		candidate.sdpMid = sdp_mid if isinstance(sdp_mid, str) else None
-		candidate.sdpMLineIndex = (
-			sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
-		)
+		candidate = None
+		if init.candidate:
+			candidate = candidate_from_sdp(init.candidate.removeprefix("candidate:"))
+			candidate.sdpMid = init.sdpMid
+			candidate.sdpMLineIndex = init.sdpMLineIndex
 		await self._peer_connection.addIceCandidate(candidate)
 
 	def _on_participant_update(self, update: ParticipantUpdate) -> None:
@@ -619,25 +637,13 @@ class LiveKitSession(SimpliSafeWebRTCSession[SignalRequest]):
 		if not trickle.candidateInit:
 			return
 
-		try:
-			candidate_init = json.loads(trickle.candidateInit)
-		except ValueError as err:
-			self._logger.warning("Dropping invalid LiveKit ICE candidate JSON: %s", err)
+		if (init := _parse_ice_candidate(trickle.candidateInit, self._logger)) is None:
 			return
-
-		candidate = candidate_init.get("candidate")
-		if not isinstance(candidate, str):
-			self._logger.warning("Dropping LiveKit ICE candidate without candidate field")
-			return
-		sdp_mid = candidate_init.get("sdpMid")
-		sdp_m_line_index = candidate_init.get("sdpMLineIndex")
 		if send_message := self._send_message:
 			send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(
-				candidate=candidate,
-				sdp_mid=sdp_mid if isinstance(sdp_mid, str) else None,
-				sdp_m_line_index=(
-					sdp_m_line_index if isinstance(sdp_m_line_index, int) else None
-				),
+				candidate=init.candidate,
+				sdp_mid=init.sdpMid,
+				sdp_m_line_index=init.sdpMLineIndex,
 			)))
 
 	async def _on_media_sections_requirement(
