@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 import logging
 from typing import TypeVar, override
 
-from pydantic import Field, TypeAdapter
+from pydantic import Field, TypeAdapter, field_validator
 from pydantic.dataclasses import dataclass
 from simplipy.device.camera import Camera
 from simplipy.system.v3 import SystemV3
@@ -156,6 +156,12 @@ class KinesisIceServer:
 	urls: list[str]
 	username: str | None = None
 	credential: str | None = None
+
+	@field_validator("urls", mode="before")
+	@classmethod
+	def _normalize_urls(cls, value: object) -> object:
+		"""Accept either URL form documented by the live-view API."""
+		return [value] if isinstance(value, str) else value
 
 
 @dataclass(kw_only=True, slots=True)
